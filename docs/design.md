@@ -53,6 +53,12 @@ The names below are a proposal for the owner to confirm. A cell value is at most
 - **Placement:** the bank sits where the entity's text would, after what precedes it; each bank's text must not depend on what precedes it.
 - **Reuse across requests (prefix):** the generator remembers the tokens its live sequence holds. A request with no bank is tokenized, compared with them, and only the tokens after the shared start are read; the rest of the cache is dropped (`kv_cache_seq_rm`) and at least the last token is always read for its logits. The cache after identical tokens is identical, so the answer does not change (tested against a fresh generator). A sequence that has a bank spliced in is not reused (a bank's tokens are not known to the runner): that request resets. Combining a shared prefix with a bank after it is not built.
 
+## One renderer for any model
+
+The seat sends OpenAI-shaped messages and tools; the model needs its own prompt text. Every model file carries its own chat template (Jinja), so membrama renders with that template (`src/template.rs`, minijinja with its Python-compatibility methods) and has no per-model renderer. Checked: the Qwen3 template from the model file renders chats with tools, tool calls and tool results to the format the template defines, and a plain chat renders byte for byte like llama.cpp's own template function. A template minijinja cannot run is an error that names it; there is no fallback guess.
+
+Not built: parsing the model's tool calls back out of its reply. The formats differ by model family (Qwen3 and many others write `<tool_call>{json}</tool_call>`); the first parser is that one, and a model whose format is not known gets its tools refused with a clear error. llama.cpp has a universal parser in C++ that the Rust crate does not expose.
+
 ## Budget
 
 The bank store has a size cap and evicts the least recently used. For the trial the cap is **2 GB** (the owner accepted it). One token of `qwen3:8b` is about 150 KB of K and V, so a 25-token bank is a few MB and the cap holds hundreds of entities. Banks live in memory first; whether they are written to disk is open.
