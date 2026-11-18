@@ -31,12 +31,17 @@ membrama reads the seat's working set (through the turn request, below) and keep
 
 ## The turn, over GraphLink
 
-A node per direction, as the provider-module plan says: the seat owns the request, membrama owns the reply, so no seat-to-peer write is needed.
+membrama is a peer the seat starts from the `peers` fact (a supervised process). On the same machine the transport is shared memory, three regions per peer (`docs/graph-link.md`, "The local transport"): the control rings `/gl-<name>-ctl`, **the seat's cell table** `/gl-<name>-sc` (the seat is its only writer; membrama maps it read-only) and **membrama's cell table** `/gl-<name>-pc` (membrama is its only writer; the seat maps it read-only and reads a node membrama owns as a replica). membrama is written against the `Transport` trait of `graphlink-core`, so a remote machine (TCP through `graphlink-net`, the way `graphlink-bridge` joins two seats) needs no change to the protocol. The seat never writes into membrama: the request is a seat-owned node and the reply is membrama-owned nodes.
 
-- Namespace `membrama::`. `membrama::Server:<name>` is a model server (model file, context size); `membrama::Turn:<id>` is one turn.
-- **Request** (seat-owned): the model server, the prompt as an ordered list of **segments**, sampling settings, an abort flag. A segment is either plain text or an **entity segment**: `{eid, version, text}`. `version` is the entity's graph version stamp when the text was rendered; `text` is exactly what the seat would have put in the prompt.
-- **Reply** (membrama-owned): chunk nodes (a cell value is at most 4096 bytes, so text is chunked), then `done` with counts (prompt tokens read, tokens loaded from banks, tokens generated) or `error`.
-- **The module never changes the prompt.** An entity segment may be served from a bank or read as text; the tokens the model sees are the same. If anything about a bank is doubtful (missing, stale, too many), the text is read.
+The names below are a proposal for the owner to confirm. A cell value is at most 4096 bytes, so text is cut into parts.
+
+- **Request** (seat-owned, written by the seat, read by membrama from `/gl-<name>-sc`): `membrane::LlmRequest:<id>` with `server` (which `membrama::Server:<name>`), `parts` (the ids of the part nodes in order), `settings` (sampling), `abort` (the seat sets it to stop; membrama reads it, no write toward membrama).
+- **Parts** (seat-owned): `membrane::LlmPart:<id>:<n>` with `kind` (`text` or `entity`) and `text`; an entity part also has `eid` and `version` (the entity's graph version stamp when the text was rendered). `text` is exactly what the seat would put in the prompt. A text longer than 4096 bytes is several consecutive parts; **an entity whose text does not fit one part is not bankable** and is read as text.
+- **Reply** (membrama-owned, in `/gl-<name>-pc`): `membrama::Reply:<id>` with `state` (`running`, `done` or `error`), `chunks` (how many chunk nodes exist), `usage` (prompt tokens read, tokens loaded from banks, tokens generated) and `error`. `membrama::Chunk:<id>:<n>` holds `text`, at most 4096 bytes, written once and never changed. The seat subscribes to the reply by its id and reads the chunks it has not seen.
+- **`membrama::Server:<name>`** (membrama-owned): the model file, its identity hash, the context size, and the state of the bank store (banks, bytes of the cap). This is also where the seat reads which models exist.
+- **The module never changes the prompt.** An entity part may be served from a bank or read as text; the tokens the model sees are the same. If anything about a bank is doubtful (missing, stale, too many, a part that did not fit), the text is read.
+- **Speed.** Shared memory has no wake-up signal: the seat notices a new chunk on its next loop turn (up to 50 ms today), so a reply arrives in steps of that size. Faster wake-up is a separate number for the owner.
+- **Cleaning up** the reply and chunk nodes of finished requests (who deletes them, and when) is open.
 
 ## The bank
 
@@ -60,7 +65,7 @@ The bank store has a size cap and evicts the least recently used. For the trial 
 ## Open points (not decided here)
 
 1. **How llama.cpp is bound: decided.** The `llama-cpp-2` crate, pinned (`=0.1.161`), default features off, `metal` on macOS. It exposes the sequence-state calls as bytes (`state_seq_get_size_ext`, `state_seq_get_data_ext`, `state_seq_set_data_ext`) and `kv_cache_seq_add/cp/rm`; there is no `can_shift`, so a model whose cache cannot shift shows up as an error from `kv_cache_seq_add` and the text is read instead. `tests/splice_model.rs` checks the splice against a real Qwen3 file (`MEMBRAMA_TEST_MODEL`); without it the test says it was skipped.
-2. **How the seat starts the module.** As a supervised peer through the `peers` fact, like the bridge. The supervision numbers are the owner's.
+2. **How the seat starts the module: decided.** A supervised peer through the `peers` fact, like the bridge; the supervision numbers are the owner's (5 s wait, 5 restarts, 60 s reset, as for the other peers).
 3. **Disk persistence of banks and how the trial cap is enforced** (count tokens or bytes).
 4. **A model whose cache cannot shift** (recurrent models): text only, no banks.
 5. **Measure first on a real banner:** what share of a real turn's prefill the focused entities take. The 50% in the test is of a very small prompt.
