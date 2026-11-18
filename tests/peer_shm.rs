@@ -65,3 +65,17 @@ fn scan_lists_the_live_cells_under_a_prefix() {
         ("membrane::LlmRequest:2".to_string(), "server".to_string(), json!("m")),
     ]);
 }
+
+#[test]
+fn the_peer_sees_the_seats_end_close() {
+    use graphlink_shm::{remove_region, Shm};
+    let name = format!("mt{}z", std::process::id() % 100000);
+    for r in ["ctl", "sc", "pc"] { let _ = remove_region(&format!("/gl-{name}-{r}")); }
+    let ctl = Shm::create(format!("/gl-{name}-ctl"), 65536).unwrap();
+    let _table = graphlink_shm::cells::Cells::create(format!("/gl-{name}-sc"), 64, 128, 4096, 1).unwrap();
+    let peer = membrama::peer::Peer::attach(&name, "membrama", &common::NUMBERS).unwrap();
+    assert!(!peer.is_closed(), "open while the seat's end is there");
+    drop(ctl);
+    assert!(peer.is_closed(), "closed once the seat's end is dropped");
+    for r in ["ctl", "sc", "pc"] { let _ = remove_region(&format!("/gl-{name}-{r}")); }
+}

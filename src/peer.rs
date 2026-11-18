@@ -11,7 +11,7 @@ use serde_json::Value as J;
 use std::collections::HashMap;
 
 /// The owner's numbers for the regions (the `peers` fact declares the same ones to the seat).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Numbers { pub slots: u64, pub key_cap: u32, pub val_cap: u32, pub epoch: u64, pub spins: u64, pub depth: usize }
 
 pub struct Peer {
@@ -58,6 +58,10 @@ impl Peer {
     }
 
     pub fn is_open(&self) -> bool { self.link.is_open() }
+
+    /// Whether the seat's end of the control rings has been dropped (the seat stopped): the peer should end.
+    /// RED STUB.
+    pub fn is_closed(&self) -> bool { false }
 
     /// Writes one cell of this peer's table (the next revision of it); the seat reads it as a replica of a node this namespace owns.
     pub fn publish(&mut self, eid: &str, prop: &str, value: &J) -> Result<(), String> {
