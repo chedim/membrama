@@ -80,6 +80,13 @@ impl Peer {
         self.ctl.send(&frame).map_err(|e| format!("the control rings: {e:?}"))
     }
 
+    /// Before reading the seat's table in a turn: the count of the seat's removals, to acknowledge after the pass. RED STUB.
+    pub fn before(&self) -> u64 { 0 }
+    /// After the pass: acknowledge the seat's removals, and reuse the slots of this table the seat has acknowledged. RED STUB.
+    pub fn after(&mut self, _seen: u64) -> Result<(), String> { Ok(()) }
+    /// A node this peer owns goes away (the seat retired the request it answered): its cells become Gone. RED STUB.
+    pub fn retire(&mut self, _eid: &str) -> Result<(), String> { Ok(()) }
+
     /// The latest value of a cell the seat published, or `None` when it is not there (or is gone or refused).
     pub fn read(&self, eid: &str, prop: &str) -> Result<Option<J>, String> {
         Ok(self.seat.get(&cell_key(eid, prop), self.spins, self.depth)?.filter(|c| c.state == CellState::Live).map(|c| c.value))
