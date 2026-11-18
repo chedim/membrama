@@ -6,7 +6,7 @@ use crate::toolcall::{detect_format, parse, Format};
 use graphlink_core::frame::Target;
 use graphlink_core::link::Event;
 use serde_json::{json, Value as J};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 const REQUEST: &str = "membrane::LlmRequest:";
 const PART: &str = "membrane::LlmPart:";
@@ -54,8 +54,8 @@ pub trait Generator {
 #[derive(Default)]
 pub struct Handler {
     subscribed: bool,
-    /// requests already answered or running: each is run once
-    started: HashSet<String>,
+    /// the `n` each request node was last run with (a node reused with a new `n` is a new request): each is run once per `n`
+    started: HashMap<String, String>,
 }
 
 /// What reading a request found.
@@ -135,12 +135,16 @@ impl Handler {
         }
         let ids: BTreeMap<String, String> = peer.scan(REQUEST)?.into_iter().map(|(eid, _, _)| { let id = eid[REQUEST.len()..].to_string(); (eid, id) }).collect();
         for (eid, id) in ids {
-            if self.started.contains(&eid) { continue; }
+            // the seat writes `n` last, as the signal that a reused node holds a new request
+            let n = peer.read(&eid, "n")?;
+            let key = n.as_ref().map(|v| v.to_string()).unwrap_or_default();
+            if self.started.get(&eid) == Some(&key) { continue; }
+            let n = n.unwrap_or(J::Null);
             match read_request(peer, &eid, &id, &*generator)? {
                 Read::Wait => {}
-                Read::Aborted => { self.started.insert(eid); finish(peer, &id, "aborted", 0, None, None)?; }
-                Read::Failed(why) => { self.started.insert(eid); finish(peer, &id, "error", 0, None, Some(&why))?; }
-                Read::Ready(job) => { self.started.insert(eid.clone()); run(peer, generator, &eid, &job)?; }
+                Read::Aborted => { self.started.insert(eid, key); reset_reply(peer, &id, &n)?; finish(peer, &id, "aborted", 0, None, None)?; }
+                Read::Failed(why) => { self.started.insert(eid, key); reset_reply(peer, &id, &n)?; finish(peer, &id, "error", 0, None, Some(&why))?; }
+                Read::Ready(job) => { self.started.insert(eid.clone(), key); reset_reply(peer, &id, &n)?; run(peer, generator, &eid, &job)?; }
             }
         }
         Ok(events)
@@ -149,6 +153,15 @@ impl Handler {
 
 fn reply(id: &str) -> String { format!("membrama::Reply:{id}") }
 fn chunk(id: &str, n: usize) -> String { format!("membrama::Chunk:{id}:{n}") }
+
+/// The start of every use of a reply: a table never reuses a slot, so the seat reuses request ids, and what the last use left in the reply (its result, its
+/// tool calls, its error) must not read as the new answer's. The reply says which `n` it answers.
+fn reset_reply(peer: &mut Peer, id: &str, n: &J) -> Result<(), String> {
+    let r = reply(id);
+    peer.publish(&r, "n", n)?;
+    for prop in ["usage", "error", "finish", "tool_calls"] { peer.publish(&r, prop, &J::Null)?; }
+    peer.publish(&r, "chunks", &json!(0))
+}
 
 /// The last words of a request's reply: the state, how many chunks exist, what it cost, why it failed.
 fn finish(peer: &mut Peer, id: &str, state: &str, chunks: usize, usage: Option<&Usage>, error: Option<&str>) -> Result<(), String> {
