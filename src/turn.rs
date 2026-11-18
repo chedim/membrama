@@ -26,6 +26,11 @@ pub struct Usage { pub read: usize, pub loaded: usize, pub generated: usize }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Job { pub id: String, pub server: String, pub parts: Vec<Part>, pub max_new: usize }
 
+/// Which parts are served from banks: the last `max_banks` entity parts, in order (the seat puts the most relevant entity last, and recency was
+/// the strongest effect when banks were glued together); text parts never, and any entity part beyond that is read as text.
+/// RED STUB.
+pub fn bank_plan(_parts: &[Part], _max_banks: usize) -> Vec<usize> { Vec::new() }
+
 /// Whatever turns a job into text. `on_text` receives the text as it is produced and answers `false` to stop (an abort).
 pub trait Generator {
     fn generate(&mut self, job: &Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String>;

@@ -121,11 +121,18 @@ impl<'m> Runner<'m> {
     pub fn decoded(&self) -> usize { self.decoded }
 }
 
-/// The generator over a real model: reads the parts as the seat wrote them, in order, then generates. Text only; banks come later.
+/// The generator over a real model: reads the parts as the seat wrote them, in order, then generates.
+/// RED STUB for banks: it reads everything as text and keeps no banks.
 pub struct EngineGenerator<'m> { runner: Runner<'m> }
 
 impl<'m> EngineGenerator<'m> {
-    pub fn new(runner: Runner<'m>) -> Self { EngineGenerator { runner } }
+    /// `model_id` identifies the model file (a bank is valid for one model only); `cap` is the most bytes of banks kept; `max_banks` is the most
+    /// entity parts of one request served from banks (the measured limit is two).
+    pub fn new(runner: Runner<'m>, _model_id: &str, _cap: usize, _max_banks: usize) -> Self { EngineGenerator { runner } }
+    /// How many banks are kept.
+    pub fn bank_count(&self) -> usize { 0 }
+    /// Whether the bank of this entity at this version and text is kept.
+    pub fn has_bank(&self, _eid: &str, _version: &str, _text: &str) -> bool { false }
 }
 
 impl crate::turn::Generator for EngineGenerator<'_> {

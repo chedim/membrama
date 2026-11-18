@@ -9,6 +9,10 @@ use graphlink_shm::{remove_region, Shm};
 use membrama::peer::{Numbers, Peer};
 use serde_json::Value as J;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::LlamaModel;
 
 pub const NUMBERS: Numbers = Numbers { slots: 64, key_cap: 128, val_cap: 4096, epoch: 1, spins: 1_000_000, depth: 32 };
 pub fn key(eid: &str, prop: &str) -> String { format!("{eid}\u{1}{prop}") }
@@ -59,3 +63,20 @@ pub fn cell(r: &CellsReader, eid: &str, prop: &str) -> Option<J> {
 
 impl Drop for FakeSeat { fn drop(&mut self) { for r in ["ctl", "sc", "pc"] { let _ = remove_region(&format!("/gl-{}-{r}", self.name)); } } }
 
+
+struct Shared { backend: LlamaBackend, model: LlamaModel }
+static SHARED: OnceLock<Shared> = OnceLock::new();
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Runs `f` with the real model: MEMBRAMA_TEST_MODEL names a Qwen3 chat gguf. Without it the test says so and passes, so CI never needs a model.
+/// A process may start the backend once and the crate says contexts must not be built in parallel, so the model is loaded once and the tests take turns.
+pub fn with_model(f: impl FnOnce(&LlamaBackend, &LlamaModel)) {
+    let Ok(path) = std::env::var("MEMBRAMA_TEST_MODEL") else { eprintln!("SKIPPED: MEMBRAMA_TEST_MODEL is not set, so this was NOT tested against a model"); return; };
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let s = SHARED.get_or_init(|| {
+        let backend = LlamaBackend::init().expect("backend");
+        let model = LlamaModel::load_from_file(&backend, &path, &LlamaModelParams::default().with_n_gpu_layers(99)).expect("model");
+        Shared { backend, model }
+    });
+    f(&s.backend, &s.model)
+}
