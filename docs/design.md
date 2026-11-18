@@ -59,7 +59,7 @@ The bank store has a size cap and evicts the least recently used. For the trial 
 
 ## Open points (not decided here)
 
-1. **How llama.cpp is bound.** An existing Rust binding if it exposes the sequence-state and memory calls above; otherwise a thin FFI of our own on a pinned llama.cpp release. To check before code.
+1. **How llama.cpp is bound: decided.** The `llama-cpp-2` crate, pinned (`=0.1.161`), default features off, `metal` on macOS. It exposes the sequence-state calls as bytes (`state_seq_get_size_ext`, `state_seq_get_data_ext`, `state_seq_set_data_ext`) and `kv_cache_seq_add/cp/rm`; there is no `can_shift`, so a model whose cache cannot shift shows up as an error from `kv_cache_seq_add` and the text is read instead. `tests/splice_model.rs` checks the splice against a real Qwen3 file (`MEMBRAMA_TEST_MODEL`); without it the test says it was skipped.
 2. **How the seat starts the module.** As a supervised peer through the `peers` fact, like the bridge. The supervision numbers are the owner's.
 3. **Disk persistence of banks and how the trial cap is enforced** (count tokens or bytes).
 4. **A model whose cache cannot shift** (recurrent models): text only, no banks.
