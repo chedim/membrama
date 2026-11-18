@@ -60,8 +60,7 @@ impl Peer {
     pub fn is_open(&self) -> bool { self.link.is_open() }
 
     /// Whether the seat's end of the control rings has been dropped (the seat stopped): the peer should end.
-    /// RED STUB.
-    pub fn is_closed(&self) -> bool { false }
+    pub fn is_closed(&self) -> bool { self.ctl.is_closed() }
 
     /// Writes one cell of this peer's table (the next revision of it); the seat reads it as a replica of a node this namespace owns.
     pub fn publish(&mut self, eid: &str, prop: &str, value: &J) -> Result<(), String> {
