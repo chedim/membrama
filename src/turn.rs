@@ -35,6 +35,8 @@ pub fn bank_plan(parts: &[Part], max_banks: usize) -> Vec<usize> {
 
 /// Whatever turns a job into text. `on_text` receives the text as it is produced and answers `false` to stop (an abort).
 pub trait Generator {
+    /// The model's own chat template (Jinja), when it has one: a chat request is rendered with it. RED STUB: none.
+    fn chat_template(&self) -> Option<String> { None }
     fn generate(&mut self, job: &Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String>;
 }
 
