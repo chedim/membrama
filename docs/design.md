@@ -57,7 +57,7 @@ The names below are a proposal for the owner to confirm. A cell value is at most
 
 The seat sends OpenAI-shaped messages and tools; the model needs its own prompt text. Every model file carries its own chat template (Jinja), so membrama renders with that template (`src/template.rs`, minijinja with its Python-compatibility methods) and has no per-model renderer. Checked: the Qwen3 template from the model file renders chats with tools, tool calls and tool results to the format the template defines, and a plain chat renders byte for byte like llama.cpp's own template function. A template minijinja cannot run is an error that names it; there is no fallback guess.
 
-Not built: parsing the model's tool calls back out of its reply. The formats differ by model family (Qwen3 and many others write `<tool_call>{json}</tool_call>`); the first parser is that one, and a model whose format is not known gets its tools refused with a clear error. llama.cpp has a universal parser in C++ that the Rust crate does not expose.
+Reading the model's tool calls back out of its reply (`src/toolcall.rs`): the formats differ by model family, and the one known is the Hermes style (`<tool_call>{json}</tool_call>`, which Qwen3 and others use). `detect_format` recognizes it from the model's own template; a model whose format is not recognized gets its tools refused with an error, never a guess. A call that is not JSON, has no name, or is cut off inside the call is an error that says so, not half a call. Arguments left out are `{}`, and arguments written as a JSON text are read. llama.cpp has a universal parser in C++ that the Rust crate does not expose; adding more formats means adding entries here.
 
 ## Budget
 
