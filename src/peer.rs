@@ -10,6 +10,10 @@ use graphlink_shm::Shm;
 use serde_json::Value as J;
 use std::collections::{HashMap, HashSet};
 
+/// What a cell of the seat's table says: its value, that it is not there (yet, or gone), or that the seat's table could not store the value and why (a `Refused` cell).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Seen { Live(J), Absent, Refused(String) }
+
 /// The owner's numbers for the regions (the `peers` fact declares the same ones to the seat).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Numbers { pub slots: u64, pub key_cap: u32, pub val_cap: u32, pub epoch: u64, pub spins: u64, pub depth: usize }
@@ -122,6 +126,15 @@ impl Peer {
     /// The latest value of a cell the seat published, or `None` when it is not there (or is gone or refused).
     pub fn read(&self, eid: &str, prop: &str) -> Result<Option<J>, String> {
         Ok(self.seat.get(&cell_key(eid, prop), self.spins, self.depth)?.filter(|c| c.state == CellState::Live).map(|c| c.value))
+    }
+
+    /// What the seat's cell says, with a refusal told apart from absence: a value that did not fit the seat's table is a `Refused` cell, and waiting for it would be waiting for ever.
+    pub fn seen(&self, eid: &str, prop: &str) -> Result<Seen, String> {
+        Ok(match self.seat.get(&cell_key(eid, prop), self.spins, self.depth)? {
+            Some(c) if c.state == CellState::Live => Seen::Live(c.value),
+            Some(c) if c.state == CellState::Refused => Seen::Refused(c.value.as_str().unwrap_or("refused").to_string()),
+            _ => Seen::Absent,
+        })
     }
 
     /// The most bytes a cell's value can take (the CBOR item as a whole, its header included).
