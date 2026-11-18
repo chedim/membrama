@@ -153,6 +153,9 @@ impl<'m> Runner<'m> {
         Ok(())
     }
 
+    /// The bits the model needs for each token of `target` after what the live sequence holds (`-log2 p`, one per token of the target). RED STUB.
+    pub fn score(&mut self, _target: &str) -> Result<Vec<f32>, String> { Ok(Vec::new()) }
+
     /// Tokens decoded since `new` (what the model had to read and write).
     pub fn decoded(&self) -> usize { self.decoded }
 }
