@@ -1,0 +1,10 @@
+[package]
+name = "membrama"
+version = "0.0.0"
+edition = "2021"
+description = "A GraphLink peer on llama.cpp that banks a model's cache for an entity's text and loads it instead of reading the text again"
+license = "MIT"
+publish = false
+
+[dependencies]
+sha2 = "0.10"
