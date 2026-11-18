@@ -1,6 +1,6 @@
 //! The turn (docs/design.md, "The turn, over GraphLink"): a request the seat wrote, run through a generator, answered with reply and chunk nodes.
 //! The handler is sans-I/O like the peer: `tick` is called by whoever owns the thread, and runs a complete request to its end before it returns.
-use crate::peer::Peer;
+use crate::peer::{Peer, Seen};
 use crate::template::{render, Options};
 use crate::toolcall::{detect_format, parse, Format};
 use graphlink_core::frame::Target;
@@ -66,19 +66,38 @@ enum Read { Wait, Aborted, Failed(String), Ready(Job) }
 
 fn truthy(v: Option<&J>) -> bool { matches!(v, Some(J::Bool(true))) }
 
+/// Why a request cannot be read: a value the seat's table could not store (a `Refused` cell) never comes, so it is an error that names the cell and the reason.
+fn refusal(eid: &str, prop: &str, why: &str) -> String {
+    format!("{eid} {prop}: the seat's table could not store it ({why}); the value size of the peer's tables must be above the largest message, tool or part")
+}
+
+/// A cell the request cannot do without: its value, `Wait` when it has not arrived, `Failed` when the seat could not store it.
+macro_rules! need {
+    ($peer:expr, $eid:expr, $prop:expr) => {
+        match $peer.seen($eid, $prop)? { Seen::Live(v) => v, Seen::Absent => return Ok(Read::Wait), Seen::Refused(why) => return Ok(Read::Failed(refusal($eid, $prop, &why))) }
+    };
+}
+
+/// A cell that may be left out: its value, or none; but one the seat could not store is an error (it must not be silently dropped from what the model is told).
+macro_rules! maybe {
+    ($peer:expr, $eid:expr, $prop:expr) => {
+        match $peer.seen($eid, $prop)? { Seen::Live(v) => Some(v), Seen::Absent => None, Seen::Refused(why) => return Ok(Read::Failed(refusal($eid, $prop, &why))) }
+    };
+}
+
 fn read_request(peer: &Peer, eid: &str, id: &str, generator: &dyn Generator) -> Result<Read, String> {
     if truthy(peer.read(eid, "abort")?.as_ref()) { return Ok(Read::Aborted); }
-    if peer.read(eid, "messages")?.is_some() { return read_chat(peer, eid, id, generator); }
-    let (Some(server), Some(parts), Some(settings)) = (peer.read(eid, "server")?, peer.read(eid, "parts")?, peer.read(eid, "settings")?) else { return Ok(Read::Wait) };
+    if maybe!(peer, eid, "messages").is_some() { return read_chat(peer, eid, id, generator); }
+    let server = need!(peer, eid, "server"); let parts = need!(peer, eid, "parts"); let settings = need!(peer, eid, "settings");
     let Some(max_new) = settings.get("max_new").and_then(J::as_u64) else { return Ok(Read::Failed("settings.max_new is required: the module has no default for it".into())) };
     let mut out = Vec::new();
     for pid in parts.as_array().into_iter().flatten().filter_map(J::as_str) {
-        let (Some(kind), Some(text)) = (peer.read(pid, "kind")?, peer.read(pid, "text")?) else { return Ok(Read::Wait) };
+        let kind = need!(peer, pid, "kind"); let text = need!(peer, pid, "text");
         let Some(text) = text.as_str().map(str::to_string) else { return Ok(Read::Failed(format!("{pid}: text is not a string"))) };
         let kind = match kind.as_str() {
             Some("text") => PartKind::Text,
             Some("entity") => {
-                let (Some(e), Some(v)) = (peer.read(pid, "entity")?, peer.read(pid, "version")?) else { return Ok(Read::Wait) };
+                let e = need!(peer, pid, "entity"); let v = need!(peer, pid, "version");
                 PartKind::Entity { eid: e.as_str().unwrap_or_default().to_string(), version: v.as_str().unwrap_or_default().to_string() }
             }
             other => return Ok(Read::Failed(format!("{pid}: unknown kind {other:?}"))),
@@ -88,32 +107,22 @@ fn read_request(peer: &Peer, eid: &str, id: &str, generator: &dyn Generator) -> 
     Ok(Read::Ready(Job { id: id.to_string(), server: server.as_str().unwrap_or_default().to_string(), parts: out, max_new: max_new as usize, chat: None }))
 }
 
-/// The text of a message's `content`: a string, or an array of strings (a message longer than one cell is written in pieces) joined.
-fn content_text(v: &J) -> Option<String> {
-    match v {
-        J::String(t) => Some(t.clone()),
-        J::Array(a) => a.iter().map(|p| p.as_str()).collect::<Option<Vec<_>>>().map(|p| p.concat()),
-        _ => None,
-    }
-}
-
-/// A chat request: `messages` (the ids of `membrane::LlmMsg:<id>:<n>` nodes: `role`, `content`, and `tool_calls` on an assistant message that made calls) and
+/// A chat request: `messages` (the ids of `membrane::LlmMsg:<id>:<n>` nodes: `role`, `content` (a string), and `tool_calls` on an assistant message that made calls) and
 /// optionally `tools` (the ids of `membrane::LlmTool:<id>:<n>` nodes: `spec`). It is rendered with the model's own template into one text part.
 fn read_chat(peer: &Peer, eid: &str, id: &str, generator: &dyn Generator) -> Result<Read, String> {
-    let (Some(server), Some(settings)) = (peer.read(eid, "server")?, peer.read(eid, "settings")?) else { return Ok(Read::Wait) };
+    let server = need!(peer, eid, "server"); let settings = need!(peer, eid, "settings"); let message_ids = need!(peer, eid, "messages");
     let Some(max_new) = settings.get("max_new").and_then(J::as_u64) else { return Ok(Read::Failed("settings.max_new is required: the module has no default for it".into())) };
     let mut messages = Vec::new();
-    for mid in peer.read(eid, "messages")?.as_ref().and_then(J::as_array).into_iter().flatten().filter_map(J::as_str) {
-        let (Some(role), Some(content)) = (peer.read(mid, "role")?, peer.read(mid, "content")?) else { return Ok(Read::Wait) };
-        let Some(text) = content_text(&content) else { return Ok(Read::Failed(format!("{mid}: content is not a string or an array of strings"))) };
+    for mid in message_ids.as_array().into_iter().flatten().filter_map(J::as_str) {
+        let role = need!(peer, mid, "role"); let content = need!(peer, mid, "content");
+        let Some(text) = content.as_str() else { return Ok(Read::Failed(format!("{mid} content: it must be a string (a value is one cell, whatever it holds)"))) };
         let mut m = json!({"role": role, "content": text});
-        if let Some(calls) = peer.read(mid, "tool_calls")? { m["tool_calls"] = calls; }
+        if let Some(calls) = maybe!(peer, mid, "tool_calls") { m["tool_calls"] = calls; }
         messages.push(m);
     }
     let mut tools = Vec::new();
-    for tid in peer.read(eid, "tools")?.as_ref().and_then(J::as_array).into_iter().flatten().filter_map(J::as_str) {
-        let Some(spec) = peer.read(tid, "spec")? else { return Ok(Read::Wait) };
-        tools.push(spec);
+    if let Some(ids) = maybe!(peer, eid, "tools") {
+        for tid in ids.as_array().into_iter().flatten().filter_map(J::as_str) { tools.push(need!(peer, tid, "spec")); }
     }
     let Some(template) = generator.chat_template() else { return Ok(Read::Failed("the model has no chat template, so a chat request cannot be rendered".into())) };
     let format = detect_format(&template);
