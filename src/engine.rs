@@ -153,8 +153,25 @@ impl<'m> Runner<'m> {
         Ok(())
     }
 
-    /// The bits the model needs for each token of `target` after what the live sequence holds (`-log2 p`, one per token of the target). RED STUB.
-    pub fn score(&mut self, _target: &str) -> Result<Vec<f32>, String> { Ok(Vec::new()) }
+    /// The bits the model needs for each token of `target` after what the live sequence holds (`-log2 p`, one per token of the target). It must come right after the text that
+    /// precedes it was read (the first token is scored from the logits of the last token read). The target's tokens are left in the live sequence: `reset` after.
+    pub fn score(&mut self, target: &str) -> Result<Vec<f32>, String> {
+        let tokens = self.tokenize(target);
+        let Some(first) = tokens.first() else { return Ok(Vec::new()) };
+        let mut bits = vec![bits_of(self.ctx.get_logits_ith(-1), *first)];
+        if tokens.len() > 1 {
+            // every target token but the last is decoded with its logits kept: the logits after token i are the distribution of token i + 1
+            let head = &tokens[..tokens.len() - 1];
+            let mut batch = LlamaBatch::new(head.len(), 1);
+            for (i, t) in head.iter().enumerate() { batch.add(*t, self.pos + i as i32, &[LIVE], true).map_err(e("batch"))?; }
+            self.ctx.decode(&mut batch).map_err(e("decode"))?;
+            for (i, t) in tokens[1..].iter().enumerate() { bits.push(bits_of(self.ctx.get_logits_ith(i as i32), *t)); }
+            self.pos += head.len() as i32;
+            self.decoded += head.len();
+            if let Some(live) = &mut self.live { live.extend_from_slice(head); }
+        }
+        Ok(bits)
+    }
 
     /// Tokens decoded since `new` (what the model had to read and write).
     pub fn decoded(&self) -> usize { self.decoded }
@@ -228,3 +245,10 @@ impl crate::turn::Generator for EngineGenerator<'_> {
 
 /// How many tokens two sequences share from the start.
 pub fn common_prefix_len<T: PartialEq>(a: &[T], b: &[T]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
+
+/// `-log2 p(token)` from raw logits (a stable log-sum-exp).
+fn bits_of(logits: &[f32], token: LlamaToken) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max + logits.iter().map(|l| (l - max).exp()).sum::<f32>().ln();
+    -(logits[token.0 as usize] - lse) / std::f32::consts::LN_2
+}

@@ -10,13 +10,13 @@ use membrama::engine::Runner;
 const PRE: &str = "<|im_start|>user\nContext about the entity:";
 fn post(q: &str) -> String { format!("\nAnswer in a few words. {q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n") }
 
-/// (name, the facts, [(question, the answer)])
+/// (name, the facts, [(question, the answer as the model writes it: capitalized, as an answer to a question)])
 const ENTITIES: [(&str, &str, [(&str, &str); 2]); 5] = [
-    ("Zorvex", " Zorvex lives in Lima. Zorvex keeps a pet hamster. Zorvex plays the clarinet.", [("Where does Zorvex live?", "Lima"), ("What pet does Zorvex keep?", "hamster")]),
-    ("Kelmar", " Kelmar lives in Tromso. Kelmar keeps a pet ferret. Kelmar plays the mandolin.", [("Where does Kelmar live?", "Tromso"), ("What instrument does Kelmar play?", "mandolin")]),
-    ("Tuvash", " Tuvash lives in Kyoto. Tuvash keeps a pet gecko. Tuvash plays the bassoon.", [("Where does Tuvash live?", "Kyoto"), ("What instrument does Tuvash play?", "bassoon")]),
-    ("Brindle", " Brindle lives in Oslo. Brindle keeps a pet parrot. Brindle plays the harp.", [("What pet does Brindle keep?", "parrot"), ("Where does Brindle live?", "Oslo")]),
-    ("Quillon", " Quillon lives in Cusco. Quillon keeps a pet tortoise. Quillon plays the flute.", [("What instrument does Quillon play?", "flute"), ("What pet does Quillon keep?", "tortoise")]),
+    ("Zorvex", " Zorvex lives in Lima. Zorvex keeps a pet hamster. Zorvex plays the clarinet.", [("Where does Zorvex live?", "Lima"), ("What pet does Zorvex keep?", "Hamster")]),
+    ("Kelmar", " Kelmar lives in Tromso. Kelmar keeps a pet ferret. Kelmar plays the mandolin.", [("Where does Kelmar live?", "Tromso"), ("What instrument does Kelmar play?", "Mandolin")]),
+    ("Tuvash", " Tuvash lives in Kyoto. Tuvash keeps a pet gecko. Tuvash plays the bassoon.", [("Where does Tuvash live?", "Kyoto"), ("What instrument does Tuvash play?", "Bassoon")]),
+    ("Brindle", " Brindle lives in Oslo. Brindle keeps a pet parrot. Brindle plays the harp.", [("What pet does Brindle keep?", "Parrot"), ("Where does Brindle live?", "Oslo")]),
+    ("Quillon", " Quillon lives in Cusco. Quillon keeps a pet tortoise. Quillon plays the flute.", [("What instrument does Quillon play?", "Flute"), ("What pet does Quillon keep?", "Tortoise")]),
 ];
 
 fn bits(r: &mut Runner, facts: Option<&str>, q: &str, answer: &str) -> f32 {

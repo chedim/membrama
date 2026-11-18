@@ -60,6 +60,14 @@ The seat sends OpenAI-shaped messages and tools; the model needs its own prompt 
 
 Reading the model's tool calls back out of its reply (`src/toolcall.rs`): the formats differ by model family, and the one known is the Hermes style (`<tool_call>{json}</tool_call>`, which Qwen3 and others use). `detect_format` recognizes it from the model's own template; a model whose format is not recognized gets its tools refused with an error, never a guess. A call that is not JSON, has no name, or is cut off inside the call is an error that says so, not half a call. Arguments left out are `{}`, and arguments written as a JSON text are read. llama.cpp has a universal parser in C++ that the Rust crate does not expose; adding more formats means adding entries here.
 
+## What the model's probabilities tell
+
+`Runner::score(target)` returns the bits the model needs for each token of a text after the text the live sequence holds (`-log2 p`). It is the first piece of using the model's own probabilities (docs only for now: no request kind yet).
+
+Measured once (`tests/score_model.rs`, `qwen3:8b`, five invented entities with three facts each, ten questions, the answer scored as the model writes it, capitalized): the answer needs on average 15.3 bits with no facts, 1.0 bits with the entity's own facts, and 37.8 bits with another entity's facts. For every question the right facts were cheapest and another's facts were worse than none. This shows the signal is there when the answer is fully determined by a stated fact and the names are invented. It does not show that it improves recall: a real memory is rarely a literal answer, and at recall time the answer is not yet known, so it cannot be scored then. A first version of the check scored lowercase answers ("hamster") and showed almost no drop, because the model writes "Hamster": the target must be what the model would write.
+
+Not built: a request kind that scores text in a given context, token probabilities of what the model generated in the reply, and any use of either by the seat.
+
 ## Slots of the cell tables
 
 A cell table never reuses a slot by itself; GraphLink 0.1.3 reclaims `Gone` slots once the reader has acknowledged the removal (graphlink `docs/shared-memory.md`, 4b), and membrama is both ends of it.
