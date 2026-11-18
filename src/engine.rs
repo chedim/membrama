@@ -179,3 +179,6 @@ impl crate::turn::Generator for EngineGenerator<'_> {
         Ok(Usage { read, loaded, generated: self.runner.decoded() - before - read })
     }
 }
+
+/// How many tokens two sequences share from the start. RED STUB.
+pub fn common_prefix_len<T: PartialEq>(_a: &[T], _b: &[T]) -> usize { 0 }
