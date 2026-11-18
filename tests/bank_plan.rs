@@ -1,4 +1,4 @@
-//! Which parts of a request are served from banks (docs/design.md, "The bank": the limit of two, and the placement).
+//! Which parts of a request are served from banks (docs/design.md, "The bank": the limit, and all or nothing).
 use membrama::turn::{bank_plan, Part, PartKind};
 
 fn text(t: &str) -> Part { Part { kind: PartKind::Text, text: t.into() } }
@@ -15,8 +15,9 @@ fn up_to_the_limit_every_entity_part_is_banked() {
 }
 
 #[test]
-fn beyond_the_limit_the_last_entity_parts_are_banked_and_the_earlier_ones_are_read_as_text() {
-    assert_eq!(bank_plan(&[ent("A"), ent("B"), ent("C"), text("q")], 2), vec![1, 2]);
+fn beyond_the_limit_nothing_is_banked_the_request_is_read_as_text() {
+    // a bank among other entities' text, or beside another bank, answered about the wrong entity (docs/design.md): all banked or none
+    assert_eq!(bank_plan(&[ent("A"), ent("B"), ent("C"), text("q")], 2), Vec::<usize>::new());
 }
 
 #[test]
