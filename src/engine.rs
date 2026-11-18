@@ -44,6 +44,9 @@ impl<'m> Runner<'m> {
         self.live = Some(Vec::new());
     }
 
+    /// The model's own chat template (Jinja text), when the file has one.
+    pub fn chat_template(&self) -> Option<String> { self.model.chat_template(None).ok()?.to_string().ok() }
+
     /// The tokens of `text`, special tokens parsed.
     pub fn tokenize(&self, text: &str) -> Vec<LlamaToken> { self.model.vocab().tokenize(text.as_bytes(), false, true) }
 
@@ -183,6 +186,8 @@ impl<'m> EngineGenerator<'m> {
 }
 
 impl crate::turn::Generator for EngineGenerator<'_> {
+    fn chat_template(&self) -> Option<String> { self.runner.chat_template() }
+
     fn generate(&mut self, job: &Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String> {
         let before = self.runner.decoded();
         let plan = bank_plan(&job.parts, self.max_banks);
