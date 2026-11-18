@@ -17,10 +17,11 @@ All on `qwen3:8b` through llama.cpp, invented entities with three short facts ea
 | One entity's bank spliced in after a fixed prefix, then the question | matches the text version (60/60 with the label inside the bank, 34 tokens decoded per question) |
 | The same, asked in pronoun form ("Where does it live?", the entity never named), the bank chosen from outside | 60/60; text 60/60; no bank 0/60; another entity's bank 2/58 |
 | Tokens decoded per question for those: text / plain bank / bank with its label | 55.8 / 32.6 / 27.9 (compute only; the bank still occupies context) |
-| Three similar banks glued together | 26/60 (first bank 4/20, middle 10/20, last 12/20); recomputing the first 16 of about 24 tokens of each later bank gets 47/60, which gives the saving back |
+| Two or three similar banks in one request (this module, short and longer facts) | the question about one entity is answered with another's, from the last bank; three glued banks scored 26/60 (first 4/20, middle 10/20, last 12/20) earlier; recomputing the first 16 of about 24 tokens of each later bank gets 47/60, which gives the saving back |
+| (kept for reference) three similar banks glued together | 26/60 (first bank 4/20, middle 10/20, last 12/20); recomputing the first 16 of about 24 tokens of each later bank gets 47/60, which gives the saving back |
 | Soft tokens, nudged vectors, a residual at the name token, the last token's hidden state | all about 0 to 1 out of 60, like a random vector |
 
-So: **one or two banks work, three or more do not**, and nothing but the model's own computed state is read as content. The design is built on that and on nothing else.
+So: **one bank in a prompt works; more than one, or one beside other entities' text, does not**, and nothing but the model's own computed state is read as content. The design is built on that and on nothing else.
 
 ## Two states, two owners
 
@@ -48,8 +49,8 @@ The names below are a proposal for the owner to confirm. A cell value is at most
 - **Key:** model identity (file hash), entity id, entity version, and a hash of the rendered text. Any change of one of them is a different bank; an old bank is dropped when its entity version moves on.
 - **Content:** the sequence state of the text computed alone from position 0, with the label inside (`Context about the entity:` and the facts, as in the 27.9-token row), taken with `llama_state_seq_get_data`.
 - **Splice:** `llama_state_seq_set_data` into a spare sequence, `llama_memory_seq_add` to shift it to its position, `llama_memory_seq_cp` into the live sequence, `llama_memory_seq_rm` the spare. Requires `llama_memory_can_shift`; a model that cannot shift gets text only.
-- **Limit of two:** at most two entity segments in a request are served from banks. More are read as text. This is the measured limit, not a tuned number; the owner can move it.
-- **Placement:** banks must be contiguous and each bank's text must not depend on what precedes it. The seat decides the order; the most relevant entity last (recency was the strongest effect in the three-bank test).
+- **All or nothing, a limit of one:** a request is served from banks only when it has at most one entity part (`bank_plan`, the limit is a number the owner can move); with more, every part is read as text. Measured in this module on `qwen3:8b` with similar entities and a question that names the entity: all text answers every question; one bank beside other entities' text answers the banked entity's question with another entity's city; two banks answer the first entity's question with the second's. A single bank in a prompt of its own text (the register case) works. The earlier statement that two banks work did not hold here, and the page is corrected.
+- **Placement:** the bank sits where the entity's text would, after what precedes it; each bank's text must not depend on what precedes it.
 - **Reuse across turns:** if the live sequence already holds the same bank at the same place, it stays; otherwise the sequence is rebuilt from the segments. No attempt to patch a sequence in the middle (llama.cpp refuses decoding at positions inside a sequence).
 
 ## Budget

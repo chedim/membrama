@@ -26,11 +26,11 @@ pub struct Usage { pub read: usize, pub loaded: usize, pub generated: usize }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Job { pub id: String, pub server: String, pub parts: Vec<Part>, pub max_new: usize }
 
-/// Which parts are served from banks: the last `max_banks` entity parts, in order (the seat puts the most relevant entity last, and recency was
-/// the strongest effect when banks were glued together); text parts never, and any entity part beyond that is read as text.
+/// Which parts are served from banks: every entity part when there are at most `max_banks` of them, else none. All or nothing, because a bank
+/// among other entities' text, or beside another bank, answered about the wrong entity (docs/design.md); a request over the limit is read as text.
 pub fn bank_plan(parts: &[Part], max_banks: usize) -> Vec<usize> {
     let entities: Vec<usize> = parts.iter().enumerate().filter(|(_, p)| matches!(p.kind, PartKind::Entity { .. })).map(|(i, _)| i).collect();
-    entities[entities.len().saturating_sub(max_banks)..].to_vec()
+    if entities.len() > max_banks { Vec::new() } else { entities }
 }
 
 /// Whatever turns a job into text. `on_text` receives the text as it is produced and answers `false` to stop (an abort).

@@ -1,13 +1,15 @@
-//! The turn handler over a real model: the seat's request is answered by the model. Needs MEMBRAMA_TEST_MODEL (a Qwen3 chat gguf); without it the test says so and passes.
+//! The turn handler over a real model: the seat's request is answered by the model, entity parts are banked or read as text. Needs MEMBRAMA_TEST_MODEL (a Qwen3 chat gguf);
+//! without it the test says so and passes. One test owns the model and runs the scenarios in turn (see tests/common).
 mod common;
-use common::{cell, with_model, FakeSeat};
+use common::{cell, model_path, FakeSeat};
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::LlamaModel;
 use membrama::engine::{EngineGenerator, Runner};
 use membrama::turn::Handler;
 use serde_json::json;
 
-#[test]
-fn a_request_over_a_real_model_is_answered() {
-    with_model(|backend, model| {
+fn a_request_over_a_real_model_is_answered(backend: &LlamaBackend, model: &LlamaModel) {
     let mut gen = EngineGenerator::new(Runner::new(model, backend, 2048).expect("runner"), "test-model", 100_000_000, 1);
 
     let mut seat = FakeSeat::start("m1");
@@ -27,7 +29,6 @@ fn a_request_over_a_real_model_is_answered() {
     assert_eq!(cell(&r, "membrama::Reply:1", "state"), Some(json!("done")));
     let answer = cell(&r, "membrama::Chunk:1:0", "text").expect("a chunk").as_str().unwrap().to_lowercase();
     assert!(answer.contains("lima"), "the model should answer from the parts: {answer:?}");
-    });
 }
 
 const PRE: &str = "<|im_start|>user\nContext about the entity:";
@@ -52,9 +53,7 @@ fn ask(seat: &mut FakeSeat, id: &str, entities: &[(&str, &str, &str)], question:
 fn answer(r: &graphlink_shm::cells::CellsReader, id: &str) -> String { cell(r, &format!("membrama::Chunk:{id}:0"), "text").map(|v| v.as_str().unwrap().to_lowercase()).unwrap_or_default() }
 fn usage(r: &graphlink_shm::cells::CellsReader, id: &str, what: &str) -> u64 { cell(r, &format!("membrama::Reply:{id}"), "usage").unwrap()[what].as_u64().unwrap() }
 
-#[test]
-fn an_entity_part_is_banked_once_and_served_from_the_bank_after() {
-    with_model(|backend, model| {
+fn an_entity_part_is_banked_once_and_served_from_the_bank_after(backend: &LlamaBackend, model: &LlamaModel) {
     let mut gen = EngineGenerator::new(Runner::new(model, backend, 2048).expect("runner"), "test-model", 100_000_000, 1);
     let mut seat = FakeSeat::start("m2");
     let mut peer = seat.peer();
@@ -70,12 +69,9 @@ fn an_entity_part_is_banked_once_and_served_from_the_bank_after() {
     assert!(gen.has_bank("Zorvex", "v1", zorvex.2), "the entity is banked");
     assert!(usage(&r, "1", "loaded") > 0 && usage(&r, "2", "loaded") > 0, "both requests load the bank");
     assert!(usage(&r, "2", "read") < usage(&r, "1", "read"), "the second request does not read the entity's text again");
-    });
 }
 
-#[test]
-fn a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped() {
-    with_model(|backend, model| {
+fn a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped(backend: &LlamaBackend, model: &LlamaModel) {
     let mut gen = EngineGenerator::new(Runner::new(model, backend, 2048).expect("runner"), "test-model", 100_000_000, 1);
     let mut seat = FakeSeat::start("m3");
     let mut peer = seat.peer();
@@ -90,13 +86,10 @@ fn a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped() {
     assert!(answer(&r, "2").contains("cusco") && !answer(&r, "2").contains("lima"), "{:?}", answer(&r, "2"));
     assert!(!gen.has_bank("Zorvex", "v1", " Zorvex lives in Lima."), "the old version's bank is gone");
     assert_eq!(gen.bank_count(), 1);
-    });
 }
 
-#[test]
-fn a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right() {
+fn a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right(backend: &LlamaBackend, model: &LlamaModel) {
     // three similar entities and a limit of one: a bank among the other entities' text answered about the wrong entity, so none is banked
-    with_model(|backend, model| {
     let mut gen = EngineGenerator::new(Runner::new(model, backend, 2048).expect("runner"), "test-model", 100_000_000, 1);
     let mut seat = FakeSeat::start("m4");
     let mut peer = seat.peer();
@@ -113,5 +106,20 @@ fn a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_r
     assert!(answer(&r, "1").contains("lima"), "{:?}", answer(&r, "1"));
     assert!(answer(&r, "2").contains("kyoto"), "{:?}", answer(&r, "2"));
     assert!(answer(&r, "3").contains("tromso"), "{:?}", answer(&r, "3"));
-    });
+}
+
+#[test]
+fn the_turn_over_a_real_model() {
+    let Some(path) = model_path() else { return };
+    let backend = LlamaBackend::init().expect("backend");
+    let model = LlamaModel::load_from_file(&backend, &path, &LlamaModelParams::default().with_n_gpu_layers(99)).expect("model");
+    for (name, scenario) in [
+        ("a_request_over_a_real_model_is_answered", a_request_over_a_real_model_is_answered as fn(&LlamaBackend, &LlamaModel)),
+        ("an_entity_part_is_banked_once_and_served_from_the_bank_after", an_entity_part_is_banked_once_and_served_from_the_bank_after as fn(&LlamaBackend, &LlamaModel)),
+        ("a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped", a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped as fn(&LlamaBackend, &LlamaModel)),
+        ("a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right", a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right as fn(&LlamaBackend, &LlamaModel)),
+    ] {
+        eprintln!("scenario: {name}");
+        scenario(&backend, &model);
+    }
 }
