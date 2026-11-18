@@ -61,7 +61,7 @@ fn read_request(peer: &Peer, eid: &str, id: &str) -> Result<Read, String> {
         let kind = match kind.as_str() {
             Some("text") => PartKind::Text,
             Some("entity") => {
-                let (Some(e), Some(v)) = (peer.read(pid, "eid")?, peer.read(pid, "version")?) else { return Ok(Read::Wait) };
+                let (Some(e), Some(v)) = (peer.read(pid, "entity")?, peer.read(pid, "version")?) else { return Ok(Read::Wait) };
                 PartKind::Entity { eid: e.as_str().unwrap_or_default().to_string(), version: v.as_str().unwrap_or_default().to_string() }
             }
             other => return Ok(Read::Failed(format!("{pid}: unknown kind {other:?}"))),
