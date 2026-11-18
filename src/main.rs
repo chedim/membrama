@@ -18,6 +18,10 @@ fn serve(cfg: Config) {
         std::env::var("GRAPHLINK_PARENT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or_else(std::os::unix::process::parent_id)
     } else { 0 };
     let mut peer = Peer::attach(&cfg.peer, &cfg.ns, &cfg.numbers).unwrap_or_else(|e| fail(&format!("cannot attach the seat's regions: {e}")));
+    if let Some(path) = &cfg.token_file {
+        let token = std::fs::read_to_string(path).unwrap_or_else(|e| fail(&format!("cannot read the token file {path}: {e}")));
+        peer = peer.with_token(token.trim().to_string());   // the token is never printed
+    }
     let backend = LlamaBackend::init().unwrap_or_else(|e| fail(&format!("llama.cpp: {e}")));
     let model = LlamaModel::load_from_file(&backend, &cfg.model, &LlamaModelParams::default().with_n_gpu_layers(99)).unwrap_or_else(|e| fail(&format!("cannot load {}: {e}", cfg.model)));
     let runner = Runner::new(&model, &backend, cfg.n_ctx).unwrap_or_else(|e| fail(&e));
@@ -36,6 +40,6 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(parse(&args[1..]).unwrap_or_else(|e| fail(&e))),
-        _ => fail("usage: membrama serve --peer <name> --ns <namespace> --model <gguf> --n-ctx <n> --slots <n> --key-cap <n> --val-cap <n> --epoch <n> --spins <n> --depth <n> --bank-cap <bytes> --max-banks <n> [--die-with-parent]"),
+        _ => fail("usage: membrama serve --peer <name> --ns <namespace> --model <gguf> --n-ctx <n> --slots <n> --key-cap <n> --val-cap <n> --epoch <n> --spins <n> --depth <n> --bank-cap <bytes> --max-banks <n> [--token-file <path>] [--die-with-parent]"),
     }
 }

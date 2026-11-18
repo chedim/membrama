@@ -31,8 +31,7 @@ fn cell_key(eid: &str, prop: &str) -> String { format!("{eid}\u{1}{prop}") }
 
 impl Peer {
     /// The token the seat made for this peer; it goes in the hello (the seat refuses a hello without one).
-    /// RED STUB: ignored.
-    pub fn with_token(self, _token: String) -> Peer { self }
+    pub fn with_token(mut self, token: String) -> Peer { self.link = self.link.with_token(token); self }
 
     /// `name` is the peer's name in the seat's `peers` fact (the regions are `/gl-<name>-ctl`, `-sc`, `-pc`); `ns` is the namespace it owns.
     pub fn attach(name: &str, ns: &str, n: &Numbers) -> Result<Peer, String> {

@@ -46,6 +46,6 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         peer: text("--peer")?, ns: text("--ns")?, model: text("--model")?, n_ctx: num(&got, "--n-ctx")?,
         numbers: Numbers { slots: num(&got, "--slots")?, key_cap: num(&got, "--key-cap")?, val_cap: num(&got, "--val-cap")?, epoch: num(&got, "--epoch")?, spins: num(&got, "--spins")?, depth: num(&got, "--depth")? },
         bank_cap: num(&got, "--bank-cap")?, max_banks: num(&got, "--max-banks")?, die_with_parent,
-        token_file: None,   // RED STUB: the option is accepted and ignored
+        token_file: got.get("--token-file").map(|v| v.to_string()),
     })
 }
