@@ -28,8 +28,10 @@ pub struct Job { pub id: String, pub server: String, pub parts: Vec<Part>, pub m
 
 /// Which parts are served from banks: the last `max_banks` entity parts, in order (the seat puts the most relevant entity last, and recency was
 /// the strongest effect when banks were glued together); text parts never, and any entity part beyond that is read as text.
-/// RED STUB.
-pub fn bank_plan(_parts: &[Part], _max_banks: usize) -> Vec<usize> { Vec::new() }
+pub fn bank_plan(parts: &[Part], max_banks: usize) -> Vec<usize> {
+    let entities: Vec<usize> = parts.iter().enumerate().filter(|(_, p)| matches!(p.kind, PartKind::Entity { .. })).map(|(i, _)| i).collect();
+    entities[entities.len().saturating_sub(max_banks)..].to_vec()
+}
 
 /// Whatever turns a job into text. `on_text` receives the text as it is produced and answers `false` to stop (an abort).
 pub trait Generator {

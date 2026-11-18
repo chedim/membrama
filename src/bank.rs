@@ -54,6 +54,9 @@ impl BankStore {
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 
+    /// Whether a bank for `key` is kept; this is not a use, so it does not move the bank in the eviction order.
+    pub fn contains(&self, key: &BankKey) -> bool { self.entries.contains_key(key) }
+
     /// The bank for `key`, counted as used now.
     pub fn get(&mut self, key: &BankKey) -> Option<&Bank> {
         self.clock += 1;

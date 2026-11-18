@@ -31,10 +31,10 @@ fn a_request_over_a_real_model_is_answered() {
 }
 
 const PRE: &str = "<|im_start|>user\nContext about the entity:";
-const POST: &str = "\nAnswer in a few words. Where does it live?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+fn post(question: &str) -> String { format!("\nAnswer in a few words. {question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n") }
 
 /// The seat writes a request of `[text PRE, entity parts..., text POST]`; the entity parts are `(eid, version, text)`.
-fn ask(seat: &mut FakeSeat, id: &str, entities: &[(&str, &str, &str)]) {
+fn ask(seat: &mut FakeSeat, id: &str, entities: &[(&str, &str, &str)], question: &str) {
     let mut ids = Vec::new();
     let mut put_part = |seat: &mut FakeSeat, n: usize, kind: &str, text: &str, ent: Option<(&str, &str)>| {
         let eid = format!("membrane::LlmPart:{id}:{n}");
@@ -44,7 +44,7 @@ fn ask(seat: &mut FakeSeat, id: &str, entities: &[(&str, &str, &str)]) {
     };
     put_part(seat, 0, "text", PRE, None);
     for (i, (e, v, t)) in entities.iter().enumerate() { put_part(seat, i + 1, "entity", t, Some((e, v))); }
-    put_part(seat, entities.len() + 1, "text", POST, None);
+    put_part(seat, entities.len() + 1, "text", &post(question), None);
     let req = format!("membrane::LlmRequest:{id}");
     seat.put(&req, "server", json!("m")); seat.put(&req, "parts", json!(ids)); seat.put(&req, "settings", json!({"max_new": 12}));
 }
@@ -61,9 +61,9 @@ fn an_entity_part_is_banked_once_and_served_from_the_bank_after() {
     seat.run(&mut peer);
     let zorvex = ("Zorvex", "v1", " Zorvex lives in Lima. Zorvex keeps a pet hamster.");
     let mut h = Handler::new();
-    ask(&mut seat, "1", &[zorvex]);
+    ask(&mut seat, "1", &[zorvex], "Where does it live?");
     for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
-    ask(&mut seat, "2", &[zorvex]);
+    ask(&mut seat, "2", &[zorvex], "Where does it live?");
     for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
     let r = seat.reader();
     assert!(answer(&r, "1").contains("lima") && answer(&r, "2").contains("lima"), "{:?} {:?}", answer(&r, "1"), answer(&r, "2"));
@@ -81,9 +81,9 @@ fn a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped() {
     let mut peer = seat.peer();
     seat.run(&mut peer);
     let mut h = Handler::new();
-    ask(&mut seat, "1", &[("Zorvex", "v1", " Zorvex lives in Lima.")]);
+    ask(&mut seat, "1", &[("Zorvex", "v1", " Zorvex lives in Lima.")], "Where does it live?");
     for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
-    ask(&mut seat, "2", &[("Zorvex", "v2", " Zorvex lives in Cusco.")]);
+    ask(&mut seat, "2", &[("Zorvex", "v2", " Zorvex lives in Cusco.")], "Where does it live?");
     for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
     let r = seat.reader();
     assert!(answer(&r, "1").contains("lima"), "{:?}", answer(&r, "1"));
@@ -102,11 +102,18 @@ fn only_the_last_two_entity_parts_of_a_request_are_banked() {
     seat.run(&mut peer);
     let (a, b, c) = ("Kelmar", "Tuvash", "Zorvex");
     let ta = " Kelmar lives in Tromso."; let tb = " Tuvash lives in Kyoto."; let tc = " Zorvex lives in Lima.";
-    ask(&mut seat, "1", &[(a, "v1", ta), (b, "v1", tb), (c, "v1", tc)]);
+    // the question names the entity (with three in the prompt "it" would be ambiguous): the last two are banks, the first is text, all three answer
     let mut h = Handler::new();
-    for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
+    for (id, who, q) in [("1", c, "Where does Zorvex live?"), ("2", b, "Where does Tuvash live?"), ("3", a, "Where does Kelmar live?")] {
+        let _ = who;
+        ask(&mut seat, id, &[(a, "v1", ta), (b, "v1", tb), (c, "v1", tc)], q);
+        for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
+    }
     assert_eq!(gen.bank_count(), 2);
     assert!(!gen.has_bank(a, "v1", ta) && gen.has_bank(b, "v1", tb) && gen.has_bank(c, "v1", tc));
-    assert!(answer(&seat.reader(), "1").contains("lima"), "{:?}", answer(&seat.reader(), "1"));
+    let r = seat.reader();
+    assert!(answer(&r, "1").contains("lima"), "{:?}", answer(&r, "1"));
+    assert!(answer(&r, "2").contains("kyoto"), "{:?}", answer(&r, "2"));
+    assert!(answer(&r, "3").contains("tromso"), "{:?}", answer(&r, "3"));
     });
 }
