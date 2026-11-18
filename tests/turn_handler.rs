@@ -141,7 +141,7 @@ fn a_request_without_max_new_is_an_error_not_a_guess() {
 fn an_entity_part_carries_its_id_and_version() {
     let (mut seat, mut peer, mut h) = started("t8");
     let eid = "membrane::LlmPart:1:0";
-    seat.put(eid, "kind", json!("entity")); seat.put(eid, "eid", json!("Zorvex")); seat.put(eid, "version", json!("v3")); seat.put(eid, "text", json!("Zorvex lives in Lima."));
+    seat.put(eid, "kind", json!("entity")); seat.put(eid, "entity", json!("Zorvex")); seat.put(eid, "version", json!("v3")); seat.put(eid, "text", json!("Zorvex lives in Lima."));
     request(&mut seat, "1", 1, json!({"max_new": 12}));
     struct Probe(Option<PartKind>);
     impl Generator for Probe { fn generate(&mut self, job: &Job, _: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String> { self.0 = Some(job.parts[0].kind.clone()); Ok(Usage::default()) } }

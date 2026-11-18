@@ -40,7 +40,7 @@ fn ask(seat: &mut FakeSeat, id: &str, entities: &[(&str, &str, &str)], question:
     let mut put_part = |seat: &mut FakeSeat, n: usize, kind: &str, text: &str, ent: Option<(&str, &str)>| {
         let eid = format!("membrane::LlmPart:{id}:{n}");
         seat.put(&eid, "kind", json!(kind)); seat.put(&eid, "text", json!(text));
-        if let Some((e, v)) = ent { seat.put(&eid, "eid", json!(e)); seat.put(&eid, "version", json!(v)); }
+        if let Some((e, v)) = ent { seat.put(&eid, "entity", json!(e)); seat.put(&eid, "version", json!(v)); }
         ids.push(eid);
     };
     put_part(seat, 0, "text", PRE, None);
