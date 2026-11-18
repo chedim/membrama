@@ -79,3 +79,11 @@ fn the_peer_sees_the_seats_end_close() {
     assert!(peer.is_closed(), "closed once the seat's end is dropped");
     for r in ["ctl", "sc", "pc"] { let _ = remove_region(&format!("/gl-{name}-{r}")); }
 }
+
+#[test]
+fn the_peers_hello_carries_the_token_the_seat_made_for_it() {
+    let mut seat = FakeSeat::start("f");
+    let mut peer = seat.peer().with_token("the-token".to_string());
+    let events = seat.run(&mut peer);
+    assert!(events.iter().any(|e| matches!(e, Event::Opened { peer_token: Some(t), .. } if t == "the-token")), "the seat should see the token: {events:?}");
+}

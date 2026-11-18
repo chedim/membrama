@@ -17,7 +17,7 @@ fn a_full_command_line_is_the_config() {
     assert_eq!(parse(&full()), Ok(Config {
         peer: "membrama".into(), ns: "membrama".into(), model: "/m/qwen3.gguf".into(), n_ctx: 2048,
         numbers: Numbers { slots: 256, key_cap: 128, val_cap: 4096, epoch: 1, spins: 1_000_000, depth: 32 },
-        bank_cap: 2_000_000_000, max_banks: 1, die_with_parent: true,
+        bank_cap: 2_000_000_000, max_banks: 1, die_with_parent: true, token_file: None,
     }));
 }
 
@@ -45,4 +45,11 @@ fn a_value_that_is_not_a_number_is_refused_and_the_option_named() {
     let mut a = full();
     let i = a.iter().position(|x| x == "--n-ctx").unwrap(); a[i + 1] = "lots".into();
     assert!(parse(&a).unwrap_err().contains("--n-ctx"));
+}
+
+#[test]
+fn a_token_file_is_optional_and_named_when_given() {
+    let mut a = full(); a.push("--token-file".into()); a.push("/d/peers/membrama.token".into());
+    assert_eq!(parse(&a).unwrap().token_file.as_deref(), Some("/d/peers/membrama.token"));
+    assert_eq!(parse(&full()).unwrap().token_file, None);
 }
