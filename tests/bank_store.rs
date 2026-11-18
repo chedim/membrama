@@ -105,3 +105,15 @@ fn the_text_hash_tells_texts_apart_and_is_stable() {
     assert_eq!(hash_text("Zorvex lives in Lima."), hash_text("Zorvex lives in Lima."));
     assert_ne!(hash_text("Zorvex lives in Lima."), hash_text("Zorvex lives in Cusco."));
 }
+
+#[test]
+fn asking_whether_a_bank_is_kept_does_not_count_as_using_it() {
+    let mut s = BankStore::new(100);
+    let (a, b, c) = (key("m", "A", "1", "a"), key("m", "B", "1", "b"), key("m", "C", "1", "c"));
+    s.put(a.clone(), bank(1, 40)).unwrap();
+    s.put(b.clone(), bank(1, 40)).unwrap();
+    assert!(s.contains(&a) && s.contains(&b) && !s.contains(&c));
+    // a was asked about, not used: it is still the oldest, so it is the one that goes
+    let evicted = s.put(c.clone(), bank(1, 40)).unwrap();
+    assert_eq!(evicted, vec![a]);
+}
