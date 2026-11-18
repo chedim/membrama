@@ -108,6 +108,30 @@ fn a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_r
     assert!(answer(&r, "3").contains("tromso"), "{:?}", answer(&r, "3"));
 }
 
+/// A second request that starts with the same parts as the first reads only what differs, and answers exactly like a request on a fresh generator.
+fn a_request_with_the_same_start_reads_only_what_differs(backend: &LlamaBackend, model: &LlamaModel) {
+    let long = format!("<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n", "You answer in a few words. ".repeat(40));
+    let run = |gen: &mut EngineGenerator, seat: &mut FakeSeat, peer: &mut membrama::peer::Peer, h: &mut Handler, id: &str, q: &str| {
+        let eid = format!("membrane::LlmPart:{id}:0"); seat.put(&eid, "kind", json!("text")); seat.put(&eid, "text", json!(long));
+        let eid2 = format!("membrane::LlmPart:{id}:1"); seat.put(&eid2, "kind", json!("text")); seat.put(&eid2, "text", json!(post(q)));
+        let req = format!("membrane::LlmRequest:{id}");
+        seat.put(&req, "server", json!("m")); seat.put(&req, "parts", json!([eid, eid2])); seat.put(&req, "settings", json!({"max_new": 8}));
+        for _ in 0..5 { h.tick(peer, gen).unwrap(); }
+    };
+    let mut gen = EngineGenerator::new(Runner::new(model, backend, 2048).expect("runner"), "test-model", 100_000_000, 1);
+    let mut seat = FakeSeat::start("m5"); let mut peer = seat.peer(); seat.run(&mut peer); let mut h = Handler::new();
+    run(&mut gen, &mut seat, &mut peer, &mut h, "1", "What is 2 plus 2?");
+    run(&mut gen, &mut seat, &mut peer, &mut h, "2", "What is the capital of France?");
+    let r = seat.reader();
+    assert!(usage(&r, "2", "read") * 3 < usage(&r, "1", "read"), "the second request reads only the question ({} against {})", usage(&r, "2", "read"), usage(&r, "1", "read"));
+    // the same second request on a generator that has never seen the first
+    let mut fresh = EngineGenerator::new(Runner::new(model, backend, 2048).expect("runner"), "test-model", 100_000_000, 1);
+    let mut seat2 = FakeSeat::start("m6"); let mut peer2 = seat2.peer(); seat2.run(&mut peer2); let mut h2 = Handler::new();
+    run(&mut fresh, &mut seat2, &mut peer2, &mut h2, "2", "What is the capital of France?");
+    assert_eq!(answer(&r, "2"), answer(&seat2.reader(), "2"), "reusing the start must not change the answer");
+    assert!(answer(&r, "2").contains("paris"), "{:?}", answer(&r, "2"));
+}
+
 #[test]
 fn the_turn_over_a_real_model() {
     let Some(path) = model_path() else { return };
@@ -117,6 +141,7 @@ fn the_turn_over_a_real_model() {
         ("a_request_over_a_real_model_is_answered", a_request_over_a_real_model_is_answered as fn(&LlamaBackend, &LlamaModel)),
         ("an_entity_part_is_banked_once_and_served_from_the_bank_after", an_entity_part_is_banked_once_and_served_from_the_bank_after as fn(&LlamaBackend, &LlamaModel)),
         ("a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped", a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped as fn(&LlamaBackend, &LlamaModel)),
+        ("a_request_with_the_same_start_reads_only_what_differs", a_request_with_the_same_start_reads_only_what_differs as fn(&LlamaBackend, &LlamaModel)),
         ("a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right", a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right as fn(&LlamaBackend, &LlamaModel)),
     ] {
         eprintln!("scenario: {name}");

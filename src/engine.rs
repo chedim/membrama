@@ -10,6 +10,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 
 /// The live sequence.
@@ -23,6 +24,8 @@ pub struct Runner<'m> {
     n_batch: usize,
     pos: i32,
     decoded: usize,
+    /// The tokens the live sequence holds, in order (prompt, then what was generated); `None` once a bank was spliced in, because a bank's tokens are not known here.
+    live: Option<Vec<LlamaToken>>,
 }
 
 fn e<T: std::fmt::Display>(what: &str) -> impl FnOnce(T) -> String + '_ { move |err| format!("{what}: {err}") }
@@ -31,18 +34,27 @@ impl<'m> Runner<'m> {
     pub fn new(model: &'m LlamaModel, backend: &LlamaBackend, n_ctx: u32) -> Result<Self, String> {
         let params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx)).with_n_batch(n_ctx);
         let ctx = model.new_context(backend, params).map_err(e("context"))?;
-        Ok(Runner { model, ctx, n_batch: n_ctx as usize, pos: 0, decoded: 0 })
+        Ok(Runner { model, ctx, n_batch: n_ctx as usize, pos: 0, decoded: 0, live: Some(Vec::new()) })
     }
 
     /// Forgets the live sequence.
     pub fn reset(&mut self) {
         self.ctx.clear_kv_cache();
         self.pos = 0;
+        self.live = Some(Vec::new());
     }
+
+    /// The tokens of `text`, special tokens parsed.
+    pub fn tokenize(&self, text: &str) -> Vec<LlamaToken> { self.model.vocab().tokenize(text.as_bytes(), false, true) }
 
     /// Reads `text` (special tokens such as `<|im_start|>` are parsed) after what the live sequence holds.
     pub fn feed_text(&mut self, text: &str) -> Result<(), String> {
-        let tokens = self.model.vocab().tokenize(text.as_bytes(), false, true);
+        let tokens = self.tokenize(text);
+        self.read_tokens(&tokens)
+    }
+
+    /// Reads `tokens` after what the live sequence holds.
+    fn read_tokens(&mut self, tokens: &[LlamaToken]) -> Result<(), String> {
         for chunk in tokens.chunks(self.n_batch) {
             let mut batch = LlamaBatch::new(chunk.len(), 1);
             let last = chunk.len() - 1;
@@ -52,8 +64,26 @@ impl<'m> Runner<'m> {
             self.ctx.decode(&mut batch).map_err(e("decode"))?;
             self.pos += chunk.len() as i32;
             self.decoded += chunk.len();
+            if let Some(live) = &mut self.live { live.extend_from_slice(chunk); }
         }
         Ok(())
+    }
+
+    /// Makes the live sequence hold exactly `tokens`: what it already holds from the start is kept (the cache after identical tokens is identical, so the
+    /// answer does not change), the rest is dropped and only the tokens that differ are read. At least the last token is always read, to have its logits.
+    /// A sequence with a spliced bank in it is not reused: it is reset.
+    pub fn set_prompt(&mut self, tokens: &[LlamaToken]) -> Result<(), String> {
+        let keep = match &self.live {
+            Some(live) => common_prefix_len(live, tokens).min(tokens.len().saturating_sub(1)),
+            None => 0,
+        };
+        let cut = keep as u32;
+        if keep == 0 || self.ctx.kv_cache_seq_rm(LIVE, Some(cut), None).is_err() { self.reset(); self.read_tokens(tokens) }
+        else {
+            self.pos = keep as i32;
+            if let Some(live) = &mut self.live { live.truncate(keep); }
+            self.read_tokens(&tokens[keep..])
+        }
     }
 
     /// The bank of `text`: read alone from position 0, then its sequence state. Leaves that text in the live sequence; `reset` after.
@@ -79,6 +109,7 @@ impl<'m> Runner<'m> {
         self.ctx.kv_cache_seq_cp(SPARE, LIVE, None, None).map_err(e("copy"))?;
         self.ctx.kv_cache_seq_rm(SPARE, None, None).map_err(e("clear"))?;
         self.pos += bank.tokens as i32;
+        self.live = None;
         Ok(())
     }
 
@@ -113,6 +144,7 @@ impl<'m> Runner<'m> {
             self.ctx.decode(&mut batch).map_err(e("decode"))?;
             self.pos += 1;
             self.decoded += 1;
+            if let Some(live) = &mut self.live { live.push(t); }
         }
         if !pending.is_empty() { on_text(&String::from_utf8_lossy(&pending)); }
         Ok(())
@@ -166,16 +198,25 @@ impl crate::turn::Generator for EngineGenerator<'_> {
                 let _ = self.store.put(key.clone(), bank);   // a bank bigger than the whole cap is not kept: its text is read below
             }
         }
-        self.runner.reset();
         let mut loaded = 0usize;
-        for (part, key) in job.parts.iter().zip(&keys) {
-            if let Some(bank) = key.as_ref().and_then(|k| self.store.get(k)) {
-                if self.runner.splice(bank).is_ok() { loaded += bank.tokens as usize; continue; }
+        if plan.is_empty() {
+            // no bank in this request: the live sequence keeps whatever the previous request shares with this one
+            let tokens: Vec<_> = job.parts.iter().flat_map(|p| self.runner.tokenize(&p.text)).collect();
+            self.runner.set_prompt(&tokens)?;
+        } else {
+            self.runner.reset();
+            for (part, key) in job.parts.iter().zip(&keys) {
+                if let Some(bank) = key.as_ref().and_then(|k| self.store.get(k)) {
+                    if self.runner.splice(bank).is_ok() { loaded += bank.tokens as usize; continue; }
+                }
+                self.runner.feed_text(&part.text)?;
             }
-            self.runner.feed_text(&part.text)?;
         }
         let read = self.runner.decoded() - before;
         self.runner.generate_with(job.max_new, on_text)?;
         Ok(Usage { read, loaded, generated: self.runner.decoded() - before - read })
     }
 }
+
+/// How many tokens two sequences share from the start.
+pub fn common_prefix_len<T: PartialEq>(a: &[T], b: &[T]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
