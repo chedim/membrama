@@ -1,7 +1,8 @@
 //! The llama.cpp side: read text into a sequence, take a bank of it, splice a bank in, generate greedily (docs/design.md, "The bank").
 //! A bank is taken from the text computed alone from position 0 and loaded after whatever precedes it, its positions shifted
 //! to where it lands (`llama_state_seq_set_data` into a spare sequence, `seq_add`, `seq_cp` into the live one, `seq_rm`).
-use crate::bank::Bank;
+use crate::bank::{hash_text, Bank, BankKey, BankStore};
+use crate::turn::{bank_plan, Job, PartKind, Usage};
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::context::session::LlamaStateSeqFlags;
 use llama_cpp_2::context::LlamaContext;
@@ -121,20 +122,60 @@ impl<'m> Runner<'m> {
     pub fn decoded(&self) -> usize { self.decoded }
 }
 
-/// The generator over a real model: reads the parts as the seat wrote them, in order, then generates. Text only; banks come later.
-pub struct EngineGenerator<'m> { runner: Runner<'m> }
+/// The generator over a real model: it reads the parts as the seat wrote them, in order, then generates. The entity parts `bank_plan` picks are
+/// served from banks (taken the first time, kept per model, entity, version and text) and spliced in where they stand; everything else is read as
+/// text, and so is a bank that cannot be kept or loaded. The tokens the model sees are the same either way.
+pub struct EngineGenerator<'m> {
+    runner: Runner<'m>,
+    store: BankStore,
+    model_id: String,
+    max_banks: usize,
+}
 
 impl<'m> EngineGenerator<'m> {
-    pub fn new(runner: Runner<'m>) -> Self { EngineGenerator { runner } }
+    /// `model_id` identifies the model file (a bank is valid for one model only); `cap` is the most bytes of banks kept; `max_banks` is the most
+    /// entity parts of one request served from banks (the measured limit is two).
+    pub fn new(runner: Runner<'m>, model_id: &str, cap: usize, max_banks: usize) -> Self {
+        EngineGenerator { runner, store: BankStore::new(cap), model_id: model_id.to_string(), max_banks }
+    }
+
+    /// How many banks are kept.
+    pub fn bank_count(&self) -> usize { self.store.len() }
+
+    /// Whether the bank of this entity at this version and text is kept.
+    pub fn has_bank(&self, eid: &str, version: &str, text: &str) -> bool { self.store.contains(&self.key(eid, version, text)) }
+
+    fn key(&self, eid: &str, version: &str, text: &str) -> BankKey {
+        BankKey { model: self.model_id.clone(), eid: eid.to_string(), version: version.to_string(), text_hash: hash_text(text) }
+    }
 }
 
 impl crate::turn::Generator for EngineGenerator<'_> {
-    fn generate(&mut self, job: &crate::turn::Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<crate::turn::Usage, String> {
-        self.runner.reset();
+    fn generate(&mut self, job: &Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String> {
         let before = self.runner.decoded();
-        for part in &job.parts { self.runner.feed_text(&part.text)?; }
+        let plan = bank_plan(&job.parts, self.max_banks);
+        let keys: Vec<Option<BankKey>> = job.parts.iter().enumerate().map(|(i, p)| match &p.kind {
+            PartKind::Entity { eid, version } if plan.contains(&i) => Some(self.key(eid, version, &p.text)),
+            _ => None,
+        }).collect();
+        // the banks first: taking one reads the entity's text alone, which clears the live sequence
+        for (part, key) in job.parts.iter().zip(&keys) {
+            let Some(key) = key else { continue };
+            if self.store.get(key).is_none() {
+                let bank = self.runner.make_bank(&part.text)?;
+                let _ = self.store.put(key.clone(), bank);   // a bank bigger than the whole cap is not kept: its text is read below
+            }
+        }
+        self.runner.reset();
+        let mut loaded = 0usize;
+        for (part, key) in job.parts.iter().zip(&keys) {
+            if let Some(bank) = key.as_ref().and_then(|k| self.store.get(k)) {
+                if self.runner.splice(bank).is_ok() { loaded += bank.tokens as usize; continue; }
+            }
+            self.runner.feed_text(&part.text)?;
+        }
         let read = self.runner.decoded() - before;
         self.runner.generate_with(job.max_new, on_text)?;
-        Ok(crate::turn::Usage { read, loaded: 0, generated: self.runner.decoded() - before - read })
+        Ok(Usage { read, loaded, generated: self.runner.decoded() - before - read })
     }
 }

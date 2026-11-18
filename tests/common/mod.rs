@@ -59,3 +59,12 @@ pub fn cell(r: &CellsReader, eid: &str, prop: &str) -> Option<J> {
 
 impl Drop for FakeSeat { fn drop(&mut self) { for r in ["ctl", "sc", "pc"] { let _ = remove_region(&format!("/gl-{}-{r}", self.name)); } } }
 
+
+/// The path of the model the model tests use: MEMBRAMA_TEST_MODEL names a Qwen3 chat gguf. Without it a test says so and passes, so CI never needs a model.
+/// A process may start the backend once and the crate says contexts must not be built in parallel, and a model held in a static outlives the Metal
+/// device's cleanup (the process aborts at exit), so a test file with model tests has ONE test that owns the model and runs its scenarios in turn.
+pub fn model_path() -> Option<String> {
+    let path = std::env::var("MEMBRAMA_TEST_MODEL").ok();
+    if path.is_none() { eprintln!("SKIPPED: MEMBRAMA_TEST_MODEL is not set, so this was NOT tested against a model"); }
+    path
+}
