@@ -11,7 +11,7 @@ use serde_json::Value as J;
 use std::collections::HashMap;
 
 /// The owner's numbers for the regions (the `peers` fact declares the same ones to the seat).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Numbers { pub slots: u64, pub key_cap: u32, pub val_cap: u32, pub epoch: u64, pub spins: u64, pub depth: usize }
 
 pub struct Peer {
@@ -30,6 +30,9 @@ pub struct Peer {
 fn cell_key(eid: &str, prop: &str) -> String { format!("{eid}\u{1}{prop}") }
 
 impl Peer {
+    /// The token the seat made for this peer; it goes in the hello (the seat refuses a hello without one).
+    pub fn with_token(mut self, token: String) -> Peer { self.link = self.link.with_token(token); self }
+
     /// `name` is the peer's name in the seat's `peers` fact (the regions are `/gl-<name>-ctl`, `-sc`, `-pc`); `ns` is the namespace it owns.
     pub fn attach(name: &str, ns: &str, n: &Numbers) -> Result<Peer, String> {
         let ctl = Shm::attach(format!("/gl-{name}-ctl"))?;
@@ -58,6 +61,9 @@ impl Peer {
     }
 
     pub fn is_open(&self) -> bool { self.link.is_open() }
+
+    /// Whether the seat's end of the control rings has been dropped (the seat stopped): the peer should end.
+    pub fn is_closed(&self) -> bool { self.ctl.is_closed() }
 
     /// Writes one cell of this peer's table (the next revision of it); the seat reads it as a replica of a node this namespace owns.
     pub fn publish(&mut self, eid: &str, prop: &str, value: &J) -> Result<(), String> {
