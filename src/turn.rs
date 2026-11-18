@@ -6,7 +6,7 @@ use crate::toolcall::{detect_format, parse, Format};
 use graphlink_core::frame::Target;
 use graphlink_core::link::Event;
 use serde_json::{json, Value as J};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const REQUEST: &str = "membrane::LlmRequest:";
 const PART: &str = "membrane::LlmPart:";
@@ -56,6 +56,9 @@ pub struct Handler {
     subscribed: bool,
     /// requests already answered or running: each is run once
     started: HashSet<String>,
+    /// requests that ran: request node -> its id; when the seat retires the request, the reply and its chunks are retired
+    finished: HashMap<String, String>,
+    reclaim_warned: bool,
 }
 
 /// What reading a request found.
@@ -126,6 +129,7 @@ impl Handler {
     /// Takes what the seat wrote and runs every request that is complete and not yet run; returns the peer's events.
     pub fn tick(&mut self, peer: &mut Peer, generator: &mut dyn Generator) -> Result<Vec<Event>, String> {
         let events = peer.poll()?;
+        let seen_removals = peer.before();   // the seat's removals counted before this turn's reading, acknowledged after it
         if !self.subscribed && peer.is_open() {
             peer.subscribe(Target::Prefix(REQUEST.into()), None)?;
             peer.subscribe(Target::Prefix(PART.into()), None)?;
@@ -134,15 +138,23 @@ impl Handler {
             self.subscribed = true;
         }
         let ids: BTreeMap<String, String> = peer.scan(REQUEST)?.into_iter().map(|(eid, _, _)| { let id = eid[REQUEST.len()..].to_string(); (eid, id) }).collect();
+        // a request the seat has retired: its reply and chunks are retired too (their cells become Gone, and their slots can be reused once the seat has acknowledged)
+        let retired: Vec<String> = self.finished.keys().filter(|e| !ids.contains_key(*e)).cloned().collect();
+        for e in retired {
+            if let Some(id) = self.finished.remove(&e) { peer.retire(&reply(&id))?; peer.retire_prefix(&format!("membrama::Chunk:{id}:"))?; }
+            self.started.remove(&e);
+        }
         for (eid, id) in ids {
             if self.started.contains(&eid) { continue; }
             match read_request(peer, &eid, &id, &*generator)? {
                 Read::Wait => {}
-                Read::Aborted => { self.started.insert(eid); finish(peer, &id, "aborted", 0, None, None)?; }
-                Read::Failed(why) => { self.started.insert(eid); finish(peer, &id, "error", 0, None, Some(&why))?; }
-                Read::Ready(job) => { self.started.insert(eid.clone()); run(peer, generator, &eid, &job)?; }
+                Read::Aborted => { self.started.insert(eid.clone()); self.finished.insert(eid, id.clone()); finish(peer, &id, "aborted", 0, None, None)?; }
+                Read::Failed(why) => { self.started.insert(eid.clone()); self.finished.insert(eid, id.clone()); finish(peer, &id, "error", 0, None, Some(&why))?; }
+                Read::Ready(job) => { self.started.insert(eid.clone()); self.finished.insert(eid.clone(), id.clone()); run(peer, generator, &eid, &job)?; }
             }
         }
+        // say the seat's removals have been seen and take the slots the seat has acknowledged; a table with no slot left for the acknowledgement is said once and tried again next turn
+        if let Err(e) = peer.after(seen_removals) { if !self.reclaim_warned { self.reclaim_warned = true; eprintln!("membrama: reclaiming slots: {e}"); } }
         Ok(events)
     }
 }

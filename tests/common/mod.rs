@@ -4,7 +4,7 @@
 use graphlink_core::frame::VERSION;
 use graphlink_core::link::{Event, Link, Me};
 use graphlink_core::transport::Transport;
-use graphlink_shm::cells::{Cells, CellsReader};
+use graphlink_shm::cells::{CellState, Cells, CellsReader, Reclaim};
 use graphlink_shm::{remove_region, Shm};
 use membrama::peer::{Numbers, Peer};
 use serde_json::Value as J;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 pub const NUMBERS: Numbers = Numbers { slots: 64, key_cap: 128, val_cap: 4096, epoch: 1, spins: 1_000_000, depth: 32 };
 pub fn key(eid: &str, prop: &str) -> String { format!("{eid}\u{1}{prop}") }
 
-pub struct FakeSeat { pub name: String, pub ctl: Shm, pub table: Cells, pub link: Link, revs: HashMap<String, f64> }
+pub struct FakeSeat { pub name: String, pub ctl: Shm, pub table: Cells, pub link: Link, revs: HashMap<String, f64>, rec: Reclaim }
 
 impl FakeSeat {
     pub fn start(tag: &str) -> FakeSeat {
@@ -23,9 +23,11 @@ impl FakeSeat {
         let table = Cells::create(format!("/gl-{name}-sc"), NUMBERS.slots, NUMBERS.key_cap, NUMBERS.val_cap, 1).expect("seat table");
         let mut link = Link::new(Me { ns: "membrane".into(), build: "fake seat".into(), epoch: 1.0, support: vec![VERSION], initiator: true });
         ctl.send(&link.open()).unwrap();
-        FakeSeat { name, ctl, table, link, revs: HashMap::new() }
+        FakeSeat { name, ctl, table, link, revs: HashMap::new(), rec: Reclaim::new() }
     }
-    pub fn peer(&self) -> Peer { Peer::attach(&self.name, "membrama", &NUMBERS).expect("peer attaches") }
+    pub fn peer(&self) -> Peer { self.peer_with(&NUMBERS) }
+    /// the peer with its own table sized as the test says (the seat's `peers` fact would declare the same numbers)
+    pub fn peer_with(&self, n: &Numbers) -> Peer { Peer::attach(&self.name, "membrama", n).expect("peer attaches") }
     /// the events the seat's link produced from what the peer sent, polling both sides a few rounds
     pub fn run(&mut self, peer: &mut Peer) -> Vec<Event> {
         let mut seen = Vec::new();
@@ -47,6 +49,27 @@ impl FakeSeat {
         let rev = self.revs.get(&k).copied().unwrap_or(0.0) + 1.0;
         self.table.put(&k, rev, &value).unwrap();
         self.revs.insert(k, rev);
+    }
+    /// The seat removes a node (retires it): every cell it wrote for it, and its node cell, become Gone.
+    pub fn retire(&mut self, eid: &str) {
+        let prefix = format!("{eid}\u{1}");
+        let keys: Vec<String> = self.revs.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+        for k in keys {
+            let rev = self.revs[&k] + 1.0;
+            self.table.mark(&k, rev, CellState::Gone, "").unwrap();
+            self.revs.insert(k, rev);
+        }
+        let node = format!("{eid}\u{1}");
+        let rev = self.revs.get(&node).copied().unwrap_or(0.0) + 1.0;
+        self.table.mark(&node, rev, CellState::Gone, "").unwrap();
+        self.revs.insert(node, rev);
+    }
+    /// The seat's turn as the reader of the peer's table, as its driver does it: read the count, scan, say it has been seen and take the peer's acknowledgement.
+    pub fn acks(&mut self) {
+        let r = self.reader();
+        let seen = Reclaim::before(&r);
+        let _ = r.scan("", 1_000_000, 32).unwrap();
+        self.rec.after(seen, &r, &mut self.table, 1_000_000, 32).unwrap();
     }
     /// What the peer has published: a reader of the peer's table.
     pub fn reader(&self) -> CellsReader { CellsReader::attach(format!("/gl-{}-pc", self.name)).expect("the peer's table") }

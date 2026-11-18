@@ -60,6 +60,14 @@ The seat sends OpenAI-shaped messages and tools; the model needs its own prompt 
 
 Reading the model's tool calls back out of its reply (`src/toolcall.rs`): the formats differ by model family, and the one known is the Hermes style (`<tool_call>{json}</tool_call>`, which Qwen3 and others use). `detect_format` recognizes it from the model's own template; a model whose format is not recognized gets its tools refused with an error, never a guess. A call that is not JSON, has no name, or is cut off inside the call is an error that says so, not half a call. Arguments left out are `{}`, and arguments written as a JSON text are read. llama.cpp has a universal parser in C++ that the Rust crate does not expose; adding more formats means adding entries here.
 
+## Slots of the cell tables
+
+A cell table never reuses a slot by itself; GraphLink 0.1.3 reclaims `Gone` slots once the reader has acknowledged the removal (graphlink `docs/shared-memory.md`, 4b), and membrama is both ends of it.
+- **membrama's own table.** The first cell of a node also makes the node's own cell (the node's id, an empty prop), which is what the seat's driver reads first. When the seat retires a request (its cells become Gone), membrama retires the reply and the chunks of that request (their cells become Gone, node and props), and forgets the request, so the id can be used again. The seat reads the removals and acknowledges them; membrama then gives those slots to new replies.
+- **The seat's table.** membrama reads the count of the seat's removals before a turn's reading and says after it that they have been seen (one cell in membrama's table, rewritten in place), so the seat can reuse the slots of retired requests, messages and parts.
+- **Sizes.** membrama's table needs a slot for the acknowledgement, and room for the replies of the requests that are in flight plus the retired ones not yet acknowledged. The numbers are the owner's.
+- A seat that never retires its requests, or a peer on an older graphlink, changes nothing: the tables fill as before.
+
 ## Budget
 
 The bank store has a size cap and evicts the least recently used. For the trial the cap is **2 GB** (the owner accepted it). One token of `qwen3:8b` is about 150 KB of K and V, so a 25-token bank is a few MB and the cap holds hundreds of entities. Banks live in memory first; whether they are written to disk is open.
