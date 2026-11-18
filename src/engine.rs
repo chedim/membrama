@@ -81,24 +81,60 @@ impl<'m> Runner<'m> {
         Ok(())
     }
 
-    /// Greedy decoding of up to `max_new` tokens from where the live sequence stands.
+    /// Greedy decoding of up to `max_new` tokens from where the live sequence stands; the text as one string.
     pub fn generate(&mut self, max_new: usize) -> Result<String, String> {
+        let mut out = String::new();
+        self.generate_with(max_new, &mut |t| { out.push_str(t); true })?;
+        Ok(out)
+    }
+
+    /// The same, handing the text to `on_text` as it is produced, whole characters only (a character the model spreads over several
+    /// tokens is held until it is complete); `on_text` answers `false` to stop.
+    pub fn generate_with(&mut self, max_new: usize, on_text: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
         let vocab = self.model.vocab();
         let mut sampler = LlamaSampler::greedy();
-        let mut out = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
         for _ in 0..max_new {
             let t = sampler.sample(&self.ctx, -1);
             if vocab.is_eog(t) { break; }
-            out.extend(vocab.token_to_piece(t, false, None));
+            pending.extend(vocab.token_to_piece(t, false, None));
+            let ok = match std::str::from_utf8(&pending) {
+                Ok(_) => pending.len(),
+                Err(err) => err.valid_up_to(),
+            };
+            if ok > 0 {
+                let text = String::from_utf8_lossy(&pending[..ok]).into_owned();
+                pending.drain(..ok);
+                if !on_text(&text) { return Ok(()); }
+            }
             let mut batch = LlamaBatch::new(1, 1);
             batch.add(t, self.pos, &[LIVE], true).map_err(e("batch"))?;
             self.ctx.decode(&mut batch).map_err(e("decode"))?;
             self.pos += 1;
             self.decoded += 1;
         }
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        if !pending.is_empty() { on_text(&String::from_utf8_lossy(&pending)); }
+        Ok(())
     }
 
     /// Tokens decoded since `new` (what the model had to read and write).
     pub fn decoded(&self) -> usize { self.decoded }
+}
+
+/// The generator over a real model: reads the parts as the seat wrote them, in order, then generates. Text only; banks come later.
+pub struct EngineGenerator<'m> { runner: Runner<'m> }
+
+impl<'m> EngineGenerator<'m> {
+    pub fn new(runner: Runner<'m>) -> Self { EngineGenerator { runner } }
+}
+
+impl crate::turn::Generator for EngineGenerator<'_> {
+    fn generate(&mut self, job: &crate::turn::Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<crate::turn::Usage, String> {
+        self.runner.reset();
+        let before = self.runner.decoded();
+        for part in &job.parts { self.runner.feed_text(&part.text)?; }
+        let read = self.runner.decoded() - before;
+        self.runner.generate_with(job.max_new, on_text)?;
+        Ok(crate::turn::Usage { read, loaded: 0, generated: self.runner.decoded() - before - read })
+    }
 }
