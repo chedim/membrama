@@ -23,7 +23,7 @@ fn a_full_command_line_is_the_config() {
 
 #[test]
 fn every_number_is_required_and_the_error_names_it() {
-    for opt in ["--peer", "--ns", "--model", "--n-ctx", "--slots", "--key-cap", "--val-cap", "--epoch", "--spins", "--depth", "--bank-cap", "--max-banks"] {
+    for opt in ["--peer", "--ns", "--model", "--n-ctx", "--slots", "--key-cap", "--val-cap", "--epoch", "--spins", "--depth", "--bank-cap"] {
         let e = parse(&without(opt)).unwrap_err();
         assert!(e.contains(opt), "{opt}: {e}");
     }
@@ -52,4 +52,12 @@ fn a_token_file_is_optional_and_named_when_given() {
     let mut a = full(); a.push("--token-file".into()); a.push("/d/peers/membrama.token".into());
     assert_eq!(parse(&a).unwrap().token_file.as_deref(), Some("/d/peers/membrama.token"));
     assert_eq!(parse(&full()).unwrap().token_file, None);
+}
+
+#[test]
+fn banks_are_on_by_default_with_the_measured_limit_of_one_and_zero_turns_them_off() {
+    // the owner's choice (2026-11-18): a request with one entity part is served from its bank unless the limit says otherwise
+    assert_eq!(parse(&without("--max-banks")).unwrap().max_banks, 1);
+    let mut off = without("--max-banks"); off.push("--max-banks".into()); off.push("0".into());
+    assert_eq!(parse(&off).unwrap().max_banks, 0);
 }
