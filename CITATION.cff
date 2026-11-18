@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "membrama"
+type: software
+authors:
+  - given-names: "Dmitrii O."
+    family-names: "Chechetkin"
+repository-code: "https://github.com/chedim/membrama"
+license: MIT
+abstract: >-
+  membrama is a GraphLink peer on llama.cpp that runs a local model for an AI seat
+  and keeps the model's own attention cache (a KV bank) for an entity's text, loading
+  it instead of reading the text again. It is a pure speed-up: the model sees the
+  same tokens either way. The design records what was measured, including that a
+  bank is safe only on its own in a prompt.
+keywords:
+  - llama.cpp
+  - KV cache
+  - GraphLink
+  - local inference
+  - memory
