@@ -77,4 +77,8 @@ impl Peer {
     pub fn read(&self, eid: &str, prop: &str) -> Result<Option<J>, String> {
         Ok(self.seat.get(&cell_key(eid, prop), self.spins, self.depth)?.filter(|c| c.state == CellState::Live).map(|c| c.value))
     }
+
+    /// The live cells of the seat's table whose node id starts with `prefix`: `(node id, prop, value)`.
+    /// RED STUB.
+    pub fn scan(&self, _prefix: &str) -> Result<Vec<(String, String, J)>, String> { Ok(Vec::new()) }
 }

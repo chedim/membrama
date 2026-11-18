@@ -102,3 +102,15 @@ impl<'m> Runner<'m> {
     /// Tokens decoded since `new` (what the model had to read and write).
     pub fn decoded(&self) -> usize { self.decoded }
 }
+
+/// The generator over a real model.
+/// RED STUB.
+pub struct EngineGenerator<'m> { _runner: Runner<'m> }
+
+impl<'m> EngineGenerator<'m> {
+    pub fn new(runner: Runner<'m>) -> Self { EngineGenerator { _runner: runner } }
+}
+
+impl crate::turn::Generator for EngineGenerator<'_> {
+    fn generate(&mut self, _job: &crate::turn::Job, _on_text: &mut dyn FnMut(&str) -> bool) -> Result<crate::turn::Usage, String> { Ok(crate::turn::Usage::default()) }
+}
