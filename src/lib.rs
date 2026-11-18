@@ -4,3 +4,4 @@ pub mod engine;
 pub mod peer;
 pub mod turn;
 pub mod cli;
+pub mod template;
