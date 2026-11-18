@@ -1,7 +1,7 @@
 //! Shared by the tests that play the seat: it makes the control rings and its cell table first and sends its hello before the peer starts,
 //! the way the seat's driver does.
 #![allow(dead_code)]
-use graphlink_core::frame::{Op, Target, VERSION};
+use graphlink_core::frame::VERSION;
 use graphlink_core::link::{Event, Link, Me};
 use graphlink_core::transport::Transport;
 use graphlink_shm::cells::{Cells, CellsReader};
@@ -52,7 +52,10 @@ impl FakeSeat {
     pub fn reader(&self) -> CellsReader { CellsReader::attach(format!("/gl-{}-pc", self.name)).expect("the peer's table") }
 }
 
-pub fn cell(r: &CellsReader, eid: &str, prop: &str) -> Option<J> { r.get(&key(eid, prop), 1_000_000, 32).unwrap().map(|c| c.value) }
+/// The value of a live cell (a refused or gone cell is `None`).
+pub fn cell(r: &CellsReader, eid: &str, prop: &str) -> Option<J> {
+    r.get(&key(eid, prop), 1_000_000, 32).unwrap().filter(|c| c.state == graphlink_shm::cells::CellState::Live).map(|c| c.value)
+}
 
 impl Drop for FakeSeat { fn drop(&mut self) { for r in ["ctl", "sc", "pc"] { let _ = remove_region(&format!("/gl-{}-{r}", self.name)); } } }
 

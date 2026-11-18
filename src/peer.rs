@@ -23,6 +23,7 @@ pub struct Peer {
     hello_sent: bool,
     spins: u64,
     depth: usize,
+    val_cap: u32,
 }
 
 /// A cell's key: the node id, U+0001, the prop (`docs/graph-link.md`).
@@ -36,7 +37,7 @@ impl Peer {
         let own = Cells::create(format!("/gl-{name}-pc"), n.slots, n.key_cap, n.val_cap, n.epoch)?;
         let seat = CellsReader::attach(format!("/gl-{name}-sc"))?;
         let link = Link::new(Me { ns: ns.into(), build: format!("membrama {}", env!("CARGO_PKG_VERSION")), epoch: n.epoch as f64, support: vec![VERSION], initiator: false });
-        Ok(Peer { ctl, link, own, seat, revs: HashMap::new(), hello_sent: false, spins: n.spins, depth: n.depth })
+        Ok(Peer { ctl, link, own, seat, revs: HashMap::new(), hello_sent: false, spins: n.spins, depth: n.depth, val_cap: n.val_cap })
     }
 
     /// Takes the frames that arrived, answers what the link answers, and returns the events (ops from the seat among them).
@@ -78,7 +79,16 @@ impl Peer {
         Ok(self.seat.get(&cell_key(eid, prop), self.spins, self.depth)?.filter(|c| c.state == CellState::Live).map(|c| c.value))
     }
 
+    /// The most bytes a cell's value can take (the CBOR item as a whole, its header included).
+    pub fn val_cap(&self) -> u32 { self.val_cap }
+
     /// The live cells of the seat's table whose node id starts with `prefix`: `(node id, prop, value)`.
-    /// RED STUB.
-    pub fn scan(&self, _prefix: &str) -> Result<Vec<(String, String, J)>, String> { Ok(Vec::new()) }
+    pub fn scan(&self, prefix: &str) -> Result<Vec<(String, String, J)>, String> {
+        let mut out = Vec::new();
+        for (key, cell) in self.seat.scan(prefix, self.spins, self.depth)? {
+            if cell.state != CellState::Live { continue; }
+            if let Some((eid, prop)) = key.split_once('\u{1}') { out.push((eid.to_string(), prop.to_string(), cell.value)); }
+        }
+        Ok(out)
+    }
 }

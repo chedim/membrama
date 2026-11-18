@@ -92,8 +92,10 @@ fn a_long_reply_is_cut_into_chunks_on_character_boundaries() {
     ticks(&mut h, &mut peer, &mut g);
     let r = seat.reader();
     let c0 = cell(&r, "membrama::Chunk:1:0", "text").unwrap(); let c1 = cell(&r, "membrama::Chunk:1:1", "text").unwrap();
-    assert_eq!(c0.as_str().unwrap().len(), 4096, "a full chunk is the cap of a cell value");
-    assert_eq!(c1.as_str().unwrap().len(), 904);
+    // a cell's value cap holds the whole CBOR item: a string this long has a 3-byte header, so a chunk is at most cap - 3 bytes, cut on a character
+    let full = (common::NUMBERS.val_cap as usize - 3) / 2 * 2;
+    assert_eq!(c0.as_str().unwrap().len(), full);
+    assert_eq!(c1.as_str().unwrap().len(), 5000 - full);
     assert_eq!(cell(&r, "membrama::Reply:1", "chunks"), Some(json!(2)));
     assert_eq!(format!("{}{}", c0.as_str().unwrap(), c1.as_str().unwrap()), "é".repeat(2500));
 }
