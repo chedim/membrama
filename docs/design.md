@@ -63,6 +63,12 @@ Reading the model's tool calls back out of its reply (`src/toolcall.rs`): the fo
 
 The bank store has a size cap and evicts the least recently used. For the trial the cap is **2 GB** (the owner accepted it). One token of `qwen3:8b` is about 150 KB of K and V, so a 25-token bank is a few MB and the cap holds hundreds of entities. Banks live in memory first; whether they are written to disk is open.
 
+## Later, not built: models loaded on demand
+
+membrama could keep several models and load one when a request needs it, evicting the least recently used under a memory cap (as the bank store does for banks), each model a `membrama::Server:<name>` node. The graph could drive it: a small model for simple or background turns and a large one for hard turns, and the model the seat's working set suggests loaded ahead of the request. The routing rule would be a number of the owner's, chosen after a measurement.
+
+Considered and not planned: choosing layers for the GPU by graph knowledge (a dense model uses every layer for every token, so there is nothing to choose by), skipping layers by topic (accuracy cost unknown), and loading mixture-of-experts experts by predicted topic (the model's own router decides from its hidden state; MoE models only; research). Per-topic LoRA adapters that are hot-swapped need training first.
+
 ## What this does not do
 
 - No vectors from the seat's embedding field go into the model. The field is the seat's recall index only.
