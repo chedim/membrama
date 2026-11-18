@@ -132,6 +132,39 @@ fn a_request_with_the_same_start_reads_only_what_differs(backend: &LlamaBackend,
     assert!(answer(&r, "2").contains("paris"), "{:?}", answer(&r, "2"));
 }
 
+/// The whole tool loop over the real model: a chat request with a tool, the model asks for it, the result goes back, the model answers from it.
+fn the_model_asks_for_a_tool_and_answers_from_its_result(backend: &LlamaBackend, model: &LlamaModel) {
+    let mut gen = EngineGenerator::new(Runner::new(model, backend, 4096).expect("runner"), "test-model", 100_000_000, 1);
+    let mut seat = FakeSeat::start("m7"); let mut peer = seat.peer(); seat.run(&mut peer); let mut h = Handler::new();
+    let msg = |seat: &mut FakeSeat, id: &str, n: usize, v: serde_json::Value| { let e = format!("membrane::LlmMsg:{id}:{n}"); for (k, x) in v.as_object().unwrap() { seat.put(&e, k, x.clone()); } };
+    seat.put("membrane::LlmTool:1:0", "spec", json!({"type": "function", "function": {"name": "get_weather", "description": "Current weather of a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}));
+    msg(&mut seat, "1", 0, json!({"role": "user", "content": "What is the weather in Lima right now? Use the tool."}));
+    let ask = |seat: &mut FakeSeat, id: &str, n: usize| {
+        let req = format!("membrane::LlmRequest:{id}");
+        seat.put(&req, "server", json!("m")); seat.put(&req, "messages", json!((0..n).map(|i| format!("membrane::LlmMsg:{id}:{i}")).collect::<Vec<_>>()));
+        seat.put(&req, "tools", json!(["membrane::LlmTool:1:0"])); seat.put(&req, "settings", json!({"max_new": 80, "enable_thinking": false}));
+    };
+    ask(&mut seat, "1", 1);
+    for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
+    let r = seat.reader();
+    assert_eq!(cell(&r, "membrama::Reply:1", "state"), Some(json!("done")), "{:?}", cell(&r, "membrama::Reply:1", "error"));
+    assert_eq!(cell(&r, "membrama::Reply:1", "finish"), Some(json!("tool_calls")), "{:?}", cell(&r, "membrama::Chunk:1:0", "text"));
+    let calls = cell(&r, "membrama::Reply:1", "tool_calls").unwrap();
+    assert_eq!(calls[0]["name"], json!("get_weather"));
+    assert!(calls[0]["arguments"]["city"].as_str().unwrap().to_lowercase().contains("lima"), "{calls}");
+    // the second request: the same chat, the assistant's call, and the tool's result
+    msg(&mut seat, "2", 0, json!({"role": "user", "content": "What is the weather in Lima right now? Use the tool."}));
+    msg(&mut seat, "2", 1, json!({"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": calls[0]["arguments"]}}]}));
+    msg(&mut seat, "2", 2, json!({"role": "tool", "content": "{\"temperature_c\": 19, \"sky\": \"fog\"}"}));
+    seat.put("membrane::LlmRequest:2", "server", json!("m")); seat.put("membrane::LlmRequest:2", "messages", json!((0..3).map(|i| format!("membrane::LlmMsg:2:{i}")).collect::<Vec<_>>()));
+    seat.put("membrane::LlmRequest:2", "tools", json!(["membrane::LlmTool:1:0"])); seat.put("membrane::LlmRequest:2", "settings", json!({"max_new": 60, "enable_thinking": false}));
+    for _ in 0..5 { h.tick(&mut peer, &mut gen).unwrap(); }
+    let r = seat.reader();
+    assert_eq!(cell(&r, "membrama::Reply:2", "finish"), Some(json!("stop")), "{:?}", cell(&r, "membrama::Chunk:2:0", "text"));
+    let a = answer(&r, "2");
+    assert!(a.contains("19") || a.contains("fog"), "the answer should use the tool's result: {a:?}");
+}
+
 #[test]
 fn the_turn_over_a_real_model() {
     let Some(path) = model_path() else { return };
@@ -141,6 +174,7 @@ fn the_turn_over_a_real_model() {
         ("a_request_over_a_real_model_is_answered", a_request_over_a_real_model_is_answered as fn(&LlamaBackend, &LlamaModel)),
         ("an_entity_part_is_banked_once_and_served_from_the_bank_after", an_entity_part_is_banked_once_and_served_from_the_bank_after as fn(&LlamaBackend, &LlamaModel)),
         ("a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped", a_new_version_of_the_entity_is_banked_again_and_the_old_bank_is_dropped as fn(&LlamaBackend, &LlamaModel)),
+        ("the_model_asks_for_a_tool_and_answers_from_its_result", the_model_asks_for_a_tool_and_answers_from_its_result as fn(&LlamaBackend, &LlamaModel)),
         ("a_request_with_the_same_start_reads_only_what_differs", a_request_with_the_same_start_reads_only_what_differs as fn(&LlamaBackend, &LlamaModel)),
         ("a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right", a_request_with_more_entity_parts_than_the_limit_is_read_as_text_and_answers_right as fn(&LlamaBackend, &LlamaModel)),
     ] {

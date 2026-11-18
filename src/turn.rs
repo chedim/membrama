@@ -1,6 +1,8 @@
 //! The turn (docs/design.md, "The turn, over GraphLink"): a request the seat wrote, run through a generator, answered with reply and chunk nodes.
 //! The handler is sans-I/O like the peer: `tick` is called by whoever owns the thread, and runs a complete request to its end before it returns.
 use crate::peer::Peer;
+use crate::template::{render, Options};
+use crate::toolcall::{detect_format, parse, Format};
 use graphlink_core::frame::Target;
 use graphlink_core::link::Event;
 use serde_json::{json, Value as J};
@@ -8,6 +10,8 @@ use std::collections::{BTreeMap, HashSet};
 
 const REQUEST: &str = "membrane::LlmRequest:";
 const PART: &str = "membrane::LlmPart:";
+const MSG: &str = "membrane::LlmMsg:";
+const TOOL: &str = "membrane::LlmTool:";
 /// The header of a CBOR text string of 256 to 65535 bytes: a cell's value cap holds the whole item, so a chunk is `val_cap` minus this.
 const CBOR_TEXT_HEADER: usize = 3;
 
@@ -24,7 +28,14 @@ pub struct Usage { pub read: usize, pub loaded: usize, pub generated: usize }
 
 /// A request that is complete: its parts have all arrived.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Job { pub id: String, pub server: String, pub parts: Vec<Part>, pub max_new: usize }
+pub struct Job {
+    pub id: String,
+    pub server: String,
+    pub parts: Vec<Part>,
+    pub max_new: usize,
+    /// Set for a chat request: the format the model writes its tool calls in, when it is known. The reply then says why it stopped and carries the calls.
+    pub chat: Option<Option<Format>>,
+}
 
 /// Which parts are served from banks: every entity part when there are at most `max_banks` of them, else none. All or nothing, because a bank
 /// among other entities' text, or beside another bank, answered about the wrong entity (docs/design.md); a request over the limit is read as text.
@@ -35,6 +46,8 @@ pub fn bank_plan(parts: &[Part], max_banks: usize) -> Vec<usize> {
 
 /// Whatever turns a job into text. `on_text` receives the text as it is produced and answers `false` to stop (an abort).
 pub trait Generator {
+    /// The model's own chat template (Jinja), when it has one: a chat request is rendered with it.
+    fn chat_template(&self) -> Option<String> { None }
     fn generate(&mut self, job: &Job, on_text: &mut dyn FnMut(&str) -> bool) -> Result<Usage, String>;
 }
 
@@ -50,8 +63,9 @@ enum Read { Wait, Aborted, Failed(String), Ready(Job) }
 
 fn truthy(v: Option<&J>) -> bool { matches!(v, Some(J::Bool(true))) }
 
-fn read_request(peer: &Peer, eid: &str, id: &str) -> Result<Read, String> {
+fn read_request(peer: &Peer, eid: &str, id: &str, generator: &dyn Generator) -> Result<Read, String> {
     if truthy(peer.read(eid, "abort")?.as_ref()) { return Ok(Read::Aborted); }
+    if peer.read(eid, "messages")?.is_some() { return read_chat(peer, eid, id, generator); }
     let (Some(server), Some(parts), Some(settings)) = (peer.read(eid, "server")?, peer.read(eid, "parts")?, peer.read(eid, "settings")?) else { return Ok(Read::Wait) };
     let Some(max_new) = settings.get("max_new").and_then(J::as_u64) else { return Ok(Read::Failed("settings.max_new is required: the module has no default for it".into())) };
     let mut out = Vec::new();
@@ -68,7 +82,42 @@ fn read_request(peer: &Peer, eid: &str, id: &str) -> Result<Read, String> {
         };
         out.push(Part { kind, text });
     }
-    Ok(Read::Ready(Job { id: id.to_string(), server: server.as_str().unwrap_or_default().to_string(), parts: out, max_new: max_new as usize }))
+    Ok(Read::Ready(Job { id: id.to_string(), server: server.as_str().unwrap_or_default().to_string(), parts: out, max_new: max_new as usize, chat: None }))
+}
+
+/// The text of a message's `content`: a string, or an array of strings (a message longer than one cell is written in pieces) joined.
+fn content_text(v: &J) -> Option<String> {
+    match v {
+        J::String(t) => Some(t.clone()),
+        J::Array(a) => a.iter().map(|p| p.as_str()).collect::<Option<Vec<_>>>().map(|p| p.concat()),
+        _ => None,
+    }
+}
+
+/// A chat request: `messages` (the ids of `membrane::LlmMsg:<id>:<n>` nodes: `role`, `content`, and `tool_calls` on an assistant message that made calls) and
+/// optionally `tools` (the ids of `membrane::LlmTool:<id>:<n>` nodes: `spec`). It is rendered with the model's own template into one text part.
+fn read_chat(peer: &Peer, eid: &str, id: &str, generator: &dyn Generator) -> Result<Read, String> {
+    let (Some(server), Some(settings)) = (peer.read(eid, "server")?, peer.read(eid, "settings")?) else { return Ok(Read::Wait) };
+    let Some(max_new) = settings.get("max_new").and_then(J::as_u64) else { return Ok(Read::Failed("settings.max_new is required: the module has no default for it".into())) };
+    let mut messages = Vec::new();
+    for mid in peer.read(eid, "messages")?.as_ref().and_then(J::as_array).into_iter().flatten().filter_map(J::as_str) {
+        let (Some(role), Some(content)) = (peer.read(mid, "role")?, peer.read(mid, "content")?) else { return Ok(Read::Wait) };
+        let Some(text) = content_text(&content) else { return Ok(Read::Failed(format!("{mid}: content is not a string or an array of strings"))) };
+        let mut m = json!({"role": role, "content": text});
+        if let Some(calls) = peer.read(mid, "tool_calls")? { m["tool_calls"] = calls; }
+        messages.push(m);
+    }
+    let mut tools = Vec::new();
+    for tid in peer.read(eid, "tools")?.as_ref().and_then(J::as_array).into_iter().flatten().filter_map(J::as_str) {
+        let Some(spec) = peer.read(tid, "spec")? else { return Ok(Read::Wait) };
+        tools.push(spec);
+    }
+    let Some(template) = generator.chat_template() else { return Ok(Read::Failed("the model has no chat template, so a chat request cannot be rendered".into())) };
+    let format = detect_format(&template);
+    if !tools.is_empty() && format.is_none() { return Ok(Read::Failed("tools are not supported for this model: the format its replies use for tool calls is not known".into())) }
+    let opts = Options { add_generation_prompt: true, enable_thinking: settings.get("enable_thinking").and_then(J::as_bool) };
+    let text = match render(&template, &messages, &tools, &opts) { Ok(t) => t, Err(e) => return Ok(Read::Failed(e)) };
+    Ok(Read::Ready(Job { id: id.to_string(), server: server.as_str().unwrap_or_default().to_string(), parts: vec![Part { kind: PartKind::Text, text }], max_new: max_new as usize, chat: Some(format) }))
 }
 
 impl Handler {
@@ -80,12 +129,14 @@ impl Handler {
         if !self.subscribed && peer.is_open() {
             peer.subscribe(Target::Prefix(REQUEST.into()), None)?;
             peer.subscribe(Target::Prefix(PART.into()), None)?;
+            peer.subscribe(Target::Prefix(MSG.into()), None)?;
+            peer.subscribe(Target::Prefix(TOOL.into()), None)?;
             self.subscribed = true;
         }
         let ids: BTreeMap<String, String> = peer.scan(REQUEST)?.into_iter().map(|(eid, _, _)| { let id = eid[REQUEST.len()..].to_string(); (eid, id) }).collect();
         for (eid, id) in ids {
             if self.started.contains(&eid) { continue; }
-            match read_request(peer, &eid, &id)? {
+            match read_request(peer, &eid, &id, &*generator)? {
                 Read::Wait => {}
                 Read::Aborted => { self.started.insert(eid); finish(peer, &id, "aborted", 0, None, None)?; }
                 Read::Failed(why) => { self.started.insert(eid); finish(peer, &id, "error", 0, None, Some(&why))?; }
@@ -119,7 +170,9 @@ fn run(peer: &mut Peer, generator: &mut dyn Generator, request: &str, job: &Job)
     let mut current = String::new();
     let mut failed: Option<String> = None;
     let mut aborted = false;
+    let mut full = String::new();   // everything the model wrote: a chat reply is parsed for tool calls at the end
     let result = generator.generate(job, &mut |piece: &str| {
+        full.push_str(piece);
         let mut rest = piece;
         while !rest.is_empty() {
             // the longest start of `rest` that fits the room left in this chunk, cut on a character
@@ -136,6 +189,18 @@ fn run(peer: &mut Peer, generator: &mut dyn Generator, request: &str, job: &Job)
     });
     match (failed, result) {
         (Some(e), _) | (None, Err(e)) => finish(peer, &job.id, "error", chunks, None, Some(&e)),
-        (None, Ok(usage)) => finish(peer, &job.id, if aborted { "aborted" } else { "done" }, chunks, Some(&usage), None),
+        (None, Ok(usage)) => {
+            if let (Some(format), false) = (job.chat.flatten(), aborted) {
+                match parse(&full, format) {
+                    Ok(p) => {
+                        let calls: Vec<J> = p.tool_calls.iter().map(|c| json!({"name": c.name, "arguments": c.arguments})).collect();
+                        if !calls.is_empty() { peer.publish(&r, "tool_calls", &J::Array(calls))?; }
+                        peer.publish(&r, "finish", &json!(if p.tool_calls.is_empty() { "stop" } else { "tool_calls" }))?;
+                    }
+                    Err(e) => return finish(peer, &job.id, "error", chunks, Some(&usage), Some(&e)),
+                }
+            } else if job.chat.is_some() && !aborted { peer.publish(&r, "finish", &json!("stop"))?; }
+            finish(peer, &job.id, if aborted { "aborted" } else { "done" }, chunks, Some(&usage), None)
+        }
     }
 }
