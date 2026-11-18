@@ -40,6 +40,6 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(parse(&args[1..]).unwrap_or_else(|e| fail(&e))),
-        _ => fail("usage: membrama serve --peer <name> --ns <namespace> --model <gguf> --n-ctx <n> --slots <n> --key-cap <n> --val-cap <n> --epoch <n> --spins <n> --depth <n> --bank-cap <bytes> --max-banks <n> [--token-file <path>] [--die-with-parent]"),
+        _ => fail("usage: membrama serve --peer <name> --ns <namespace> --model <gguf> --n-ctx <n> --slots <n> --key-cap <n> --val-cap <n> --epoch <n> --spins <n> --depth <n> --bank-cap <bytes> [--max-banks <n>] [--token-file <path>] [--die-with-parent]"),
     }
 }

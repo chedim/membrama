@@ -15,13 +15,16 @@ pub struct Config {
     pub numbers: Numbers,
     /// The most bytes of banks kept.
     pub bank_cap: usize,
-    /// The most entity parts of one request served from banks.
+    /// The most entity parts of one request served from banks; 0 turns banks off. Defaults to 1.
     pub max_banks: usize,
     /// End when the process that started this one is gone.
     pub die_with_parent: bool,
     /// The file holding the token the seat made for this peer (`<data dir>/peers/<name>.token`): the seat refuses a hello without one.
     pub token_file: Option<String>,
 }
+
+/// Banks are on unless the limit says otherwise: the owner's choice (2026-11-18), and the measured limit (a bank is safe only alone in a prompt).
+pub const DEFAULT_MAX_BANKS: usize = 1;
 
 const VALUED: [&str; 13] = ["--token-file", "--peer", "--ns", "--model", "--n-ctx", "--slots", "--key-cap", "--val-cap", "--epoch", "--spins", "--depth", "--bank-cap", "--max-banks"];
 
@@ -45,7 +48,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     Ok(Config {
         peer: text("--peer")?, ns: text("--ns")?, model: text("--model")?, n_ctx: num(&got, "--n-ctx")?,
         numbers: Numbers { slots: num(&got, "--slots")?, key_cap: num(&got, "--key-cap")?, val_cap: num(&got, "--val-cap")?, epoch: num(&got, "--epoch")?, spins: num(&got, "--spins")?, depth: num(&got, "--depth")? },
-        bank_cap: num(&got, "--bank-cap")?, max_banks: num(&got, "--max-banks")?, die_with_parent,
+        bank_cap: num(&got, "--bank-cap")?, max_banks: if got.contains_key("--max-banks") { num(&got, "--max-banks")? } else { DEFAULT_MAX_BANKS }, die_with_parent,
         token_file: got.get("--token-file").map(|v| v.to_string()),
     })
 }
