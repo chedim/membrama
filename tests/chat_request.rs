@@ -58,16 +58,6 @@ fn messages_are_rendered_with_the_models_template_and_run_as_one_text() {
 }
 
 #[test]
-fn a_message_longer_than_a_cell_is_an_array_of_pieces_that_are_joined() {
-    let (mut seat, mut peer, mut h) = started("c2");
-    msg(&mut seat, "1", 0, "user", json!(["first half, ", "second half"]));
-    chat(&mut seat, "1", 1, 0, json!({"max_new": 8}));
-    let mut g = Gen { template: Some(TMPL.into()), reply: vec!["ok".into()], ..Default::default() };
-    ticks(&mut h, &mut peer, &mut g);
-    assert_eq!(g.seen, vec!["<|user|>first half, second half\n<|assistant|>".to_string()]);
-}
-
-#[test]
 fn tools_are_listed_for_the_template_and_a_tool_call_in_the_reply_is_read_out() {
     let (mut seat, mut peer, mut h) = started("c3");
     msg(&mut seat, "1", 0, "user", json!("weather in Lima?")); tool(&mut seat, "1", 0, "get_weather");

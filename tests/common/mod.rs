@@ -50,6 +50,13 @@ impl FakeSeat {
         self.table.put(&k, rev, &value).unwrap();
         self.revs.insert(k, rev);
     }
+    /// The seat's table could not store a value (it did not fit): the cell is Refused, and its value says why, as the seat's driver writes it.
+    pub fn refuse(&mut self, eid: &str, prop: &str, why: &str) {
+        let k = key(eid, prop);
+        let rev = self.revs.get(&k).copied().unwrap_or(0.0) + 1.0;
+        self.table.mark(&k, rev, CellState::Refused, why).unwrap();
+        self.revs.insert(k, rev);
+    }
     /// The seat removes a node (retires it): every cell it wrote for it, and its node cell, become Gone.
     pub fn retire(&mut self, eid: &str) {
         let prefix = format!("{eid}\u{1}");
