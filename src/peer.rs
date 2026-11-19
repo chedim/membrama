@@ -2,7 +2,7 @@
 //! The seat makes the control rings `/gl-<name>-ctl` and its cell table `/gl-<name>-sc` and sends its hello first; the peer attaches both, answers,
 //! makes its own cell table `/gl-<name>-pc` (it is the only writer; the seat maps it read-only) and reads the seat's cells it subscribed to.
 //! Sans-I/O like the library: `poll` is called by whoever owns the thread; nothing here blocks or starts a thread.
-use graphlink_core::frame::{Op, Target, VERSION};
+use graphlink_core::frame::{Op, QueryBy, Target, VERSION};
 use graphlink_core::link::{Event, Link, Me};
 use graphlink_core::transport::Transport;
 use graphlink_shm::cells::{CellState, Cells, CellsReader, Reclaim};
@@ -31,6 +31,7 @@ pub struct Peer {
     spins: u64,
     depth: usize,
     val_cap: u32,
+    asked: u64,
 }
 
 /// A cell's key: the node id, U+0001, the prop (`docs/graph-link.md`).
@@ -47,7 +48,7 @@ impl Peer {
         let own = Cells::create(format!("/gl-{name}-pc"), n.slots, n.key_cap, n.val_cap, n.epoch)?;
         let seat = CellsReader::attach(format!("/gl-{name}-sc"))?;
         let link = Link::new(Me { ns: ns.into(), build: format!("membrama {}", env!("CARGO_PKG_VERSION")), epoch: n.epoch as f64, support: vec![VERSION], initiator: false });
-        Ok(Peer { ctl, link, own, seat, revs: HashMap::new(), nodes: HashSet::new(), reclaim: Reclaim::new(), hello_sent: false, spins: n.spins, depth: n.depth, val_cap: n.val_cap })
+        Ok(Peer { ctl, link, own, seat, revs: HashMap::new(), nodes: HashSet::new(), reclaim: Reclaim::new(), hello_sent: false, spins: n.spins, depth: n.depth, val_cap: n.val_cap, asked: 0 })
     }
 
     /// Takes the frames that arrived, answers what the link answers, and returns the events (ops from the seat among them).
@@ -148,5 +149,39 @@ impl Peer {
             if let Some((eid, prop)) = key.split_once('\u{1}') { out.push((eid.to_string(), prop.to_string(), cell.value)); }
         }
         Ok(out)
+    }
+
+    /// The next id for an op that gets an answer (`wid`, `rid`, `qid`).
+    fn next_id(&mut self, kind: &str) -> String { self.asked += 1; format!("{kind}{}", self.asked) }
+
+    fn send_ops(&mut self, ops: Vec<Op>) -> Result<(), String> {
+        let frame = self.link.send(ops)?;
+        self.ctl.send(&frame).map_err(|e| format!("the control rings: {e:?}"))
+    }
+
+    /// Writes a node the seat owns (`wr`); the id of the write, whose answer comes back as an `Op::Res` event.
+    pub fn write(&mut self, id: &str, prop: &str, value: &J) -> Result<String, String> {
+        let wid = self.next_id("w");
+        self.send_ops(vec![Op::Wr { wid: wid.clone(), id: id.into(), prop: prop.into(), value: value.clone() }])?;
+        Ok(wid)
+    }
+
+    /// Asks the seat for the props of a node (`read`); the id of the ask, whose answer comes back as an `Op::Val` event with that `rid`.
+    pub fn read_req(&mut self, id: &str, props: &[String]) -> Result<String, String> {
+        let rid = self.next_id("r");
+        self.send_ops(vec![Op::Read { id: id.into(), props: props.to_vec(), rid: rid.clone() }])?;
+        Ok(rid)
+    }
+
+    /// Asks the seat for a page of nodes (`q`); the id of the query, whose answer comes back as an `Op::Page` event.
+    pub fn query(&mut self, by: QueryBy, after: Option<String>, limit: Option<u64>) -> Result<String, String> {
+        let qid = self.next_id("q");
+        self.send_ops(vec![Op::Query { qid: qid.clone(), by, after, limit }])?;
+        Ok(qid)
+    }
+
+    /// Whether the seat says a node it published exists: `None` while it has said nothing about it.
+    pub fn exists(&self, eid: &str) -> Result<Option<bool>, String> {
+        Ok(self.seat.get(&cell_key(eid, ""), self.spins, self.depth)?.map(|c| c.state == CellState::Live))
     }
 }

@@ -6,3 +6,4 @@ pub mod turn;
 pub mod cli;
 pub mod template;
 pub mod toolcall;
+pub mod brain;

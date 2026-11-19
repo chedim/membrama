@@ -1,5 +1,6 @@
 //! The command line of `membrama serve`, the program the seat starts from its `peers` fact. Every number is the owner's and has no default
 //! (the regions' sizes must equal what the seat declared; the model's context and the bank limits are the owner's choices).
+use crate::brain::BrainConfig;
 use crate::peer::Numbers;
 use std::collections::HashMap;
 
@@ -21,6 +22,8 @@ pub struct Config {
     pub die_with_parent: bool,
     /// The file holding the token the seat made for this peer (`<data dir>/peers/<name>.token`): the seat refuses a hello without one.
     pub token_file: Option<String>,
+    /// The loop's numbers, when `--loop` is given.
+    pub brain: Option<BrainConfig>,
 }
 
 /// Banks are on unless the limit says otherwise: the owner's choice (2026-11-18), and the measured limit (a bank is safe only alone in a prompt).
@@ -49,6 +52,6 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         peer: text("--peer")?, ns: text("--ns")?, model: text("--model")?, n_ctx: num(&got, "--n-ctx")?,
         numbers: Numbers { slots: num(&got, "--slots")?, key_cap: num(&got, "--key-cap")?, val_cap: num(&got, "--val-cap")?, epoch: num(&got, "--epoch")?, spins: num(&got, "--spins")?, depth: num(&got, "--depth")? },
         bank_cap: num(&got, "--bank-cap")?, max_banks: if got.contains_key("--max-banks") { num(&got, "--max-banks")? } else { DEFAULT_MAX_BANKS }, die_with_parent,
-        token_file: got.get("--token-file").map(|v| v.to_string()),
+        token_file: got.get("--token-file").map(|v| v.to_string()), brain: None,
     })
 }
