@@ -1,0 +1,26 @@
+PACK membrama_logview 1
+IMPORT dom 1
+IMPORT shell_view 1
+-- THE LOG TAB (written to the seat by membrama when it connects, `Pack:membrama_logview.text`; the seat places it on the page because it imports `dom`). A tab in the shell (`Nav:membrama_log`,
+-- the view-pack contract of docs/ui-rebuild-plan.md) that lists the boundary log the way the seat's LogView answered membrama's last ask: one line per change, which node and property, what happened, who
+-- wrote it. It reads `membrane::LogView:@NS@` by its link; the view exists for as long as membrama asks, and the guard pack removes this tab when membrama's link is not up.
+
+Shell.open on-setter membrama-log-register:
+  WHEN this.open:
+    ('Nav:membrama_log').title = 'Log'
+    ('Nav:membrama_log').order = 85
+
+Nav.active on-setter membrama-log-draw:
+  WHEN this.eid == 'Nav:membrama_log' and this.active == True:
+    ('DomNode:mlog:root').tag = 'pre'
+    ('DomNode:mlog:root').parent = 'DomNode:shell:slot:membrama_log'
+    ('Nav:membrama_log').filled = True
+    ('MLog:main').on = True
+
+MLog.lines getter: [str(prop(r, 'n')) + ' ' + str(prop(r, 'eid')) + '.' + str(prop(r, 'prop')) + ' ' + str(prop(r, 'op')) + ' by ' + str(prop(r, 'writer')) for r in (prop('membrane::LogView:@NS@', 'rows') or [])]
+MLog.lines on-setter membrama-log-lines:
+  WHEN this.on == True:
+    ('DomNode:mlog:root').text = join(this.lines, '\n')
+MLog.on on-setter membrama-log-first:
+  WHEN this.on == True:
+    ('DomNode:mlog:root').text = join(this.lines, '\n')

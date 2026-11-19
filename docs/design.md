@@ -76,6 +76,24 @@ A cell table never reuses a slot by itself; GraphLink 0.1.3 reclaims `Gone` slot
 - **Sizes.** membrama's table needs a slot for the acknowledgement, and room for the replies of the requests that are in flight plus the retired ones not yet acknowledged. The numbers are the owner's.
 - A seat that never retires its requests, or a peer on an older graphlink, changes nothing: the tables fill as before.
 
+## The loop (`src/brain.rs`, started by `membrama serve ... --loop ...`; tests `tests/loop_brain.rs`, `tests/loop_cli.rs`)
+
+membrama also runs as a co-processor on its own clock: it is told what changed in the seat's graph, builds its own prompt, calls its model, and acts over the link. Nothing here changes the turn above; the same process and the same model serve both, one call at a time.
+
+- **Reading.** The seat's boundary log is a view, `membrane::LogView:<ns>` (babyseat `docs/logview.md`). The loop asks by writing its own `membrama::LogAsk:main` (`from` = its cursor, `n` = a count of asks, new each time because the seat caches an answer by its arguments) and reads `rows`: `{n, eid, prop, op, writer, ts, size}`, pointers and never values. It takes the rows from its cursor on, once each, at most `--loop-delta-cap` held at a time. `--loop-start head` skips what was written before it connected; `beginning` reads all of it. A page the peer cannot take is the error "the log page could not be read".
+- **What wakes a step.** An outside line (a `writer` other than `link:<ns>`, the writer the seat records for this peer's writes) or an alarm. Its own writes are in the log too: they do not wake it, and are in the next delta marked "(yours)".
+- **The step is stateless.** Messages are `system` = the doctrine, read from the seat at every step, and `user` = the delta (one line per change, then the alarms that went off). Nothing else carries over. The doctrine is the seat node `membrane::Doctrine:membrama`, property `text`: the operator edits it there. membrama writes the first draft (`src/brain/doctrine.md`) only when the node does not exist. With no doctrine the step waits, the lines stay, and the loop's `error` names the node.
+- **Tools** (the model's, over the link): `write` (`wr`: the seat's answer, ok or refused with its reason, is the tool's result), `read` (`read`), `query` (`q`, a prefix or a class), `alarm` (`after_seconds`, `note`: a node `membrama::Alarm:<n>` in membrama's own namespace, fired once and retired; it is the only way time reaches the model). A step is at most `--loop-max-rounds` model calls; a call with a bad argument or an unknown tool gets the reason as its result. Reads and queries wait for the seat's answer across turns, with no timeout.
+- **What is visible.** `membrama::Loop:main` has `cursor`, `steps`, `said` (the last words of a step) and `error` (plain words, also on stderr; null after a clean step): a failed model call, a refused write, the round limit, a missing doctrine, a log page that did not fit. Nothing about the transport is in it.
+- **On connect** it writes two packs to the seat through `Pack:<name>.text`: `membrama_logview` (a tab `Nav:membrama_log` drawn in `DomNode:shell:slot:membrama_log`, listing the rows of the LogView; it imports `dom`, so the seat places it on the page) and `membrama_logguard` (runs on the seat; when `Vm:<ns>.link` is not `up` it sets both `Pack:<name>.text` to `None`). The token file is read as before; what the seat lets it write is the seat's decision from the token's `grants` claim.
+- **The model** is `TemplateModel`: the step rendered with the model's own chat template, run with `--loop-max-new`, tool calls read out of the reply (Hermes style).
+
+The owner's numbers, none with a default: `--loop-delta-cap`, `--loop-max-new`, `--loop-max-rounds`, `--loop-ask-ms`, `--loop-start`.
+
+Tests use a stub model and a fake seat (`tests/common`, the seat's end of the link, a LogView, a write gate that accepts or refuses). They prove the loop's own logic. They do not prove what a real model writes in answer to the doctrine, that the seat's real LogView and write gate behave as the fake does, or that the two packs load and run in the seat and the page.
+
+Not built: the model-authored filters (code the model writes to mute deltas), hosted models (claude, openai) as delegate tools, alarms that survive a restart (they live in this process), a model-call priority between the seat's turns and the loop.
+
 ## Budget
 
 The bank store has a size cap and evicts the least recently used. For the trial the cap is **2 GB** (the owner accepted it). One token of `qwen3:8b` is about 150 KB of K and V, so a 25-token bank is a few MB and the cap holds hundreds of entities. Banks live in memory first; whether they are written to disk is open.

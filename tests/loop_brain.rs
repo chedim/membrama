@@ -25,13 +25,15 @@ struct Sim {
     refuse: Option<String>,
     reader: Option<CellsReader>,
     served_n: f64,
+    /// the LogView's page does not fit the peer's table: the cell is Refused, as the seat's driver writes it
+    rows_too_big: bool,
 }
 
 impl Sim {
     fn new(tag: &str, doctrine: Option<&str>) -> (Sim, Peer) {
         let seat = FakeSeat::start(tag);
         let mut peer = seat.peer();
-        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], refuse: None, reader: None, served_n: -1.0 };
+        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], refuse: None, reader: None, served_n: -1.0, rows_too_big: false };
         if let Some(d) = doctrine { sim.nodes.entry(DOCTRINE_ID.into()).or_default().insert("text".into(), json!(d)); }
         sim.pump(&mut peer);
         (sim, peer)
@@ -95,7 +97,7 @@ impl Sim {
         let rows: Vec<J> = self.journal.iter().skip(from).take(200).cloned().collect();
         let next = from + rows.len();
         let head = if self.journal.is_empty() { J::Null } else { json!(self.journal.len() - 1) };
-        self.seat.put(LOGVIEW, "rows", json!(rows));
+        if self.rows_too_big { self.seat.refuse(LOGVIEW, "rows", "value is 31000 bytes, the table's value size is 4096"); } else { self.seat.put(LOGVIEW, "rows", json!(rows)); }
         self.seat.put(LOGVIEW, "next", json!(next));
         self.seat.put(LOGVIEW, "head", head);
     }
@@ -408,7 +410,7 @@ fn with_no_doctrine_on_the_seat_the_step_waits_with_the_lines_kept_and_the_error
 fn a_log_page_too_big_for_the_peer_is_an_error_in_plain_words() {
     let mut r = Rig::new("l20", Some("d"), BrainConfig { start: Start::Beginning, ..cfg() });
     r.drive(4);
-    r.sim.seat.refuse(LOGVIEW, "rows", "value is 31000 bytes, the table's value size is 4096");
+    r.sim.rows_too_big = true;
     r.drive(6);
     let e = r.error().expect("visible");
     assert!(e.to_lowercase().contains("log"), "{e}");
