@@ -866,3 +866,20 @@ fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker(
     let last = model.partials.last().unwrap();
     assert!(last.starts_with("[\u{2026}earlier text dropped]\n") && last.ends_with("THE-END"), "{}", &last[..40]);
 }
+
+#[test]
+fn a_later_write_to_an_answered_item_in_the_same_step_is_skipped_with_no_write_and_no_row() {
+    let mut r = Rig::new("k1", Some("d"), cfg());
+    r.drive(4);
+    let resp = "Chat:main:message:a1:turn:response";
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi"}))]));
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi again, differently"})), ("write", json!({"id": "Note:9", "prop": "text", "value": "other"}))]));
+    owed(&mut r, &["a1"]);
+    r.drive(14);
+    assert_eq!(r.sim.written(resp, "text"), vec![json!("hi")], "the second write never reached the seat");
+    assert_eq!(r.sim.written("Note:9", "text"), vec![json!("other")], "a different node still goes through");
+    let told: Vec<String> = r.model.seen[2].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert!(told.iter().any(|t| t == "skipped: this item is already answered in this step"), "{told:?}");
+    assert_eq!(tool_nodes(&r).len(), 2, "rows for the first write and for Note:9 only: {:?}", tool_nodes(&r));
+    assert!(r.sim.writes.iter().filter(|w| w.1 == "result").count() == 2, "no result row for the skipped call");
+}
