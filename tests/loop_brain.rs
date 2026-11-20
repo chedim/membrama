@@ -4,7 +4,7 @@
 //! seat's real LogView or write gate (cliffvm), or about the packs running in a real engine.
 mod common;
 use common::{cell, FakeSeat};
-use graphlink_core::frame::{Op, Target, ValBody};
+use graphlink_core::frame::{Op, Target};
 use graphlink_core::link::Event;
 use graphlink_core::transport::Transport;
 use graphlink_shm::cells::CellsReader;
