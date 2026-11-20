@@ -51,6 +51,8 @@ pub const LOOP_ID: &str = "membrama::Loop:main";
 const ASK_ID: &str = "membrama::LogAsk:main";
 /// The seat's node of what it owes this peer: `items`, oldest first, `{message, response}` (the answer goes to the response node as a write of `text`, or `declined` with a reason).
 fn owed_id(ns: &str) -> String { format!("membrane::Owed:{ns}") }
+/// The result of a write to an item the step has already answered.
+const SKIPPED: &str = "skipped: this item is already answered in this step";
 const ALARM: &str = "membrama::Alarm:";
 /// The seat's node a clifflet is run on: `membrane::Cliff:<ns>:<call id>` (the peer writes `code`; the seat's runner writes `result` or `error`).
 const CLIFF: &str = "membrane::Cliff:";
@@ -395,9 +397,10 @@ impl Brain {
         for (i, c) in reply.tool_calls.iter().enumerate() {
             slots.push(self.trail.len());
             call_ids.push(self.call_id(round, i));
-            self.show_call(peer, &self.call_id(round, i), c)?;
+            let skip = self.skipped(c);
+            if !skip { self.show_call(peer, &self.call_id(round, i), c)?; }
             self.trail.push(json!({"step": no, "round": round, "tool": c.name, "args": c.arguments}));
-            pending.push(self.call(peer, c, &self.call_id(round, i))?);
+            pending.push(if skip { Pend::Done(SKIPPED.to_string()) } else { self.call(peer, c, &self.call_id(round, i))? });
         }
         if let Some(step) = &mut self.step { step.pending = pending; step.slots = slots; step.call_ids.extend(call_ids); }
         self.record_results(peer)?;
@@ -431,6 +434,14 @@ impl Brain {
         Ok(())
     }
 
+    /// A write of `text` or `declined` to the response of an item this step has already answered: the answer is final for the step.
+    fn skipped(&self, c: &ToolCall) -> bool {
+        let (Some(step), "write") = (&self.step, c.name.as_str()) else { return false };
+        let a = &c.arguments;
+        let (Some(id), Some(prop)) = (a.get("id").and_then(J::as_str), a.get("prop").and_then(J::as_str)) else { return false };
+        (prop == "text" || prop == "declined") && step.answered.iter().any(|e| e == id)
+    }
+
     /// A call that was not run: its entry in the trail, with the reason as its result.
     fn trail_call(&mut self, no: u64, round: usize, c: &ToolCall, result: &str) {
         eprintln!("membrama: step {no} round {round} {} {} -> {result}", c.name, c.arguments);
@@ -447,7 +458,7 @@ impl Brain {
             let Pend::Done(t) = p else { continue };
             let Some(e) = self.trail.get_mut(*slot) else { continue };
             if e.get("result").is_some() { continue; }
-            if let Some(id) = step.call_ids.get(first + k) { rows.push((id.clone(), t.clone())); }
+            if let Some(id) = step.call_ids.get(first + k).filter(|id| step.issued.contains(id)) { rows.push((id.clone(), t.clone())); }
             eprintln!("membrama: step {no} round {} {} {} -> {t}", e["round"], e["tool"].as_str().unwrap_or(""), e["args"]);
             e["result"] = json!(t);
         }
@@ -469,7 +480,10 @@ impl Brain {
         Ok(())
     }
 
-    /// A tool call's id: letters and digits only (the seat's runner makes it part of pack names and refuses anything else), and different for each run of the process, step, round and call.
+    /// The result of a write the step already answered the item for.
+const SKIPPED: &str = "skipped: this item is already answered in this step";
+
+/// A tool call's id: letters and digits only (the seat's runner makes it part of pack names and refuses anything else), and different for each run of the process, step, round and call.
     fn call_id(&self, round: usize, i: usize) -> String { format!("c{}s{}r{round}n{i}", self.run, self.steps) }
 
     /// Says on the loop's node what the step in hand is waiting for (null when it waits for nothing): a wait has no timeout, so it must be seen.
