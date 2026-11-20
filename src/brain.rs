@@ -56,6 +56,9 @@ pub fn viewer_pack(ns: &str) -> String { fill(include_str!("brain/logview.c1f"),
 /// The seat-side guard: removes both packs when `Vm:<ns>.link` is not up.
 pub fn guard_pack(ns: &str) -> String { fill(include_str!("brain/logguard.c1f"), ns) }
 
+/// STUB (red): the published `said` is not yet cut.
+pub fn strip_thinking(text: &str) -> String { text.to_string() }
+
 /// The tools of a step, as the model is shown them.
 pub fn tool_specs() -> Vec<J> {
     let f = |name: &str, description: &str, parameters: J| json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}});
