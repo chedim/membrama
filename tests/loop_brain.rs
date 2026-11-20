@@ -636,5 +636,5 @@ fn a_trail_that_does_not_fit_the_peers_cell_drops_the_oldest_entries_and_says_ho
     let t = trail(&r);
     assert!(t[0]["dropped"].as_u64().unwrap() > 0, "{:?}", t.first());
     assert!(serde_json::to_string(&t).unwrap().len() <= r.peer.val_cap() as usize);
-    assert!(t.last().unwrap()["tool"] == "write", "the newest entries are kept");
+    assert!(t.last().unwrap()["text"] == "ok" && t.iter().any(|e| e["tool"] == "write"), "the newest entries are kept");
 }

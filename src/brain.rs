@@ -5,7 +5,7 @@
 //! nothing is kept from one step to the next: doctrine + delta is the whole contract.
 use crate::peer::{Peer, Seen};
 use crate::template::{render, Options};
-use crate::toolcall::{detect_format, parse, ToolCall};
+use crate::toolcall::{detect_format, parse, visible, ToolCall};
 use crate::turn::{Generator, Job, Part, PartKind};
 use graphlink_core::frame::{Op, Target};
 use graphlink_core::link::Event;
@@ -87,7 +87,8 @@ enum Inflight { Write { id: String, prop: String }, System(String), Cliff, Quiet
 /// A tool call of the current round: its result, or the id of the op that will bring it.
 enum Pend { Done(String), Wait { id: String, what: String }, Read { id: String, props: Vec<String> }, Cliff { node: String, wid: String } }
 
-struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, failed: bool }
+/// `slots`: for each pending call, the place of its entry in the trail.
+struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool }
 
 pub struct Brain {
     cfg: BrainConfig,
@@ -113,6 +114,9 @@ pub struct Brain {
     /// the wall clock at construction, in milliseconds, in hex: part of every call id so a restart (the step counter starts at 0 again) cannot repeat one
     run: String,
     waiting: Option<String>,
+    /// the last step's trail: for each round the model's visible text, for each tool call `{step, round, tool, args, result}`
+    trail: Vec<J>,
+    published_trail: Option<String>,
 }
 
 /// The writer the seat records for a write this peer makes (`link:<namespace>`): the lines in the log with it are the loop's own.
@@ -122,7 +126,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, trail: vec![], published_trail: None,
         }
     }
 
@@ -255,7 +259,8 @@ impl Brain {
                 delta.push_str("Alarms that went off:\n");
                 for (id, note) in self.fired.drain(..) { delta.push_str(&format!("alarm {id}: {note}\n")); }
             }
-            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], failed: false });
+            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], slots: vec![], failed: false });
+            self.trail.clear();
             return self.round(peer, model);
         }
         self.settle(peer, model)
@@ -304,6 +309,7 @@ impl Brain {
         }
         for node in unsub { peer.unsubscribe(Target::Id(node))?; }
         self.show_waiting(peer)?;
+        self.record_results(peer)?;
         let Some(step) = &mut self.step else { return Ok(()) };
         if step.pending.iter().any(|p| matches!(p, Pend::Wait { .. } | Pend::Read { .. } | Pend::Cliff { .. })) { return Ok(()); }
         for p in std::mem::take(&mut step.pending) { if let Pend::Done(t) = p { step.messages.push(json!({"role": "tool", "content": t})); } }
@@ -319,17 +325,62 @@ impl Brain {
             Ok(r) => r,
             Err(e) => { self.fail(peer, &format!("the model call failed: {e}")); return self.finish(peer, None); }
         };
-        if reply.tool_calls.is_empty() { return self.finish(peer, Some(reply.text)); }
+        let seen = visible(&reply.text);
+        let no = self.steps + 1;
+        if !seen.is_empty() { eprintln!("membrama: step {no} round {round} said {seen}"); self.trail.push(json!({"step": no, "round": round, "text": seen})); }
+        if reply.tool_calls.is_empty() { self.show_trail(peer)?; return self.finish(peer, Some(reply.text)); }
         if round >= self.cfg.max_rounds {
+            for c in &reply.tool_calls { self.trail_call(no, round, c, "not run: the step ended at the round limit"); }
+            self.show_trail(peer)?;
             self.fail(peer, &format!("the step ended after {} rounds with the model still asking for tools; those calls were not run", self.cfg.max_rounds));
             return self.finish(peer, Some(reply.text));
         }
         let calls: Vec<J> = reply.tool_calls.iter().enumerate().map(|(i, c)| json!({"id": self.call_id(round, i), "type": "function", "function": {"name": c.name, "arguments": c.arguments}})).collect();
         if let Some(step) = &mut self.step { step.messages.push(json!({"role": "assistant", "content": reply.text, "tool_calls": calls})); }
         let mut pending = Vec::new();
-        for (i, c) in reply.tool_calls.iter().enumerate() { pending.push(self.call(peer, c, &self.call_id(round, i))?); }
-        if let Some(step) = &mut self.step { step.pending = pending; }
+        let mut slots = Vec::new();
+        for (i, c) in reply.tool_calls.iter().enumerate() {
+            slots.push(self.trail.len());
+            self.trail.push(json!({"step": no, "round": round, "tool": c.name, "args": c.arguments}));
+            pending.push(self.call(peer, c, &self.call_id(round, i))?);
+        }
+        if let Some(step) = &mut self.step { step.pending = pending; step.slots = slots; }
+        self.record_results(peer)?;
         self.show_waiting(peer)
+    }
+
+    /// A call that was not run: its entry in the trail, with the reason as its result.
+    fn trail_call(&mut self, no: u64, round: usize, c: &ToolCall, result: &str) {
+        eprintln!("membrama: step {no} round {round} {} {} -> {result}", c.name, c.arguments);
+        self.trail.push(json!({"step": no, "round": round, "tool": c.name, "args": c.arguments, "result": result}));
+    }
+
+    /// Puts the result of each call that has one into its trail entry (and on stderr), once.
+    fn record_results(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let Some(step) = &self.step else { return Ok(()) };
+        let no = self.steps + 1;
+        for (p, slot) in step.pending.iter().zip(step.slots.iter()) {
+            let Pend::Done(t) = p else { continue };
+            let Some(e) = self.trail.get_mut(*slot) else { continue };
+            if e.get("result").is_some() { continue; }
+            eprintln!("membrama: step {no} round {} {} {} -> {t}", e["round"], e["tool"].as_str().unwrap_or(""), e["args"]);
+            e["result"] = json!(t);
+        }
+        self.show_trail(peer)
+    }
+
+    /// Publishes the trail when it changed. A trail the peer's cells cannot hold gives up its oldest entries, and says how many (`{dropped: n}`).
+    fn show_trail(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let cap = peer.val_cap() as usize;
+        let fits = |v: &[J]| serde_json::to_string(v).map_or(false, |t| t.len() <= cap);
+        let mut shown = self.trail.clone();
+        for k in 1..=self.trail.len() {
+            if fits(&shown) { break; }
+            shown = std::iter::once(json!({"dropped": k})).chain(self.trail[k..].iter().cloned()).collect();
+        }
+        let text = serde_json::to_string(&shown).unwrap_or_default();
+        if self.published_trail.as_deref() != Some(text.as_str()) { peer.publish(LOOP_ID, "trail", &J::Array(shown))?; self.published_trail = Some(text); }
+        Ok(())
     }
 
     /// A tool call's id: letters and digits only (the seat's runner makes it part of pack names and refuses anything else), and different for each run of the process, step, round and call.
