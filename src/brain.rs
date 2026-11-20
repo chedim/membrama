@@ -94,7 +94,7 @@ struct Alarm { id: u64, at_ms: u64, note: String }
 enum Inflight { Write { id: String, prop: String }, System(String), Cliff, Quiet }
 
 /// A tool call of the current round: its result, or the id of the op that will bring it.
-enum Pend { Done(String), Wait { id: String, what: String }, Read { id: String, props: Vec<String> }, Cliff { node: String, wid: String } }
+enum Pend { Done(String), Wait { id: String, what: String }, Cliff { node: String, wid: String } }
 
 /// `slots`: for each pending call, the place of its entry in the trail.
 struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool, wrote: Vec<(String, String)>, turns: Vec<(String, String, Vec<String>)>, call_ids: Vec<String>, issued: Vec<String> }
@@ -303,23 +303,9 @@ impl Brain {
     fn settle(&mut self, peer: &mut Peer, model: &mut dyn Model) -> Result<(), String> {
         let Some(step) = &mut self.step else { return Ok(()) };
         let mut retire: Vec<String> = vec![];
-        let mut unsub: Vec<String> = vec![];
         for p in step.pending.iter_mut() {
             match p {
                 Pend::Wait { id, .. } => { if let Some(t) = self.answers.remove(id.as_str()) { *p = Pend::Done(t); } }
-                Pend::Read { id, props } => {
-                    // the seat publishes what is subscribed: a node it says is gone is not there, a live one has its props in cells
-                    let told = match peer.exists(id)? {
-                        None => None,
-                        Some(false) => Some("there is no such node".to_string()),
-                        Some(true) => {
-                            let mut m = serde_json::Map::new();
-                            for k in props.iter() { if let Seen::Live(v) = peer.seen(id, k)? { m.insert(k.clone(), v); } }
-                            Some(J::Object(m).to_string())
-                        }
-                    };
-                    if let Some(t) = told { unsub.push(id.clone()); *p = Pend::Done(t); }
-                }
                 Pend::Cliff { node, wid } => {
                     let done = if let Some(t) = self.answers.remove(wid.as_str()) { Some((t, false)) } else {
                         match (peer.seen(node, "result")?, peer.seen(node, "error")?) {
@@ -340,11 +326,10 @@ impl Brain {
             self.inflight.insert(wid, Inflight::Quiet);
             peer.unsubscribe(Target::Id(node))?;
         }
-        for node in unsub { peer.unsubscribe(Target::Id(node))?; }
         self.show_waiting(peer)?;
         self.record_results(peer)?;
         let Some(step) = &mut self.step else { return Ok(()) };
-        if step.pending.iter().any(|p| matches!(p, Pend::Wait { .. } | Pend::Read { .. } | Pend::Cliff { .. })) { return Ok(()); }
+        if step.pending.iter().any(|p| matches!(p, Pend::Wait { .. } | Pend::Cliff { .. })) { return Ok(()); }
         for p in std::mem::take(&mut step.pending) { if let Pend::Done(t) = p { step.messages.push(json!({"role": "tool", "content": t})); } }
         self.round(peer, model)
     }
@@ -484,7 +469,6 @@ impl Brain {
         let now: Option<String> = self.step.as_ref().and_then(|s| {
             let w: Vec<String> = s.pending.iter().filter_map(|p| match p {
                 Pend::Wait { what, .. } => Some(what.clone()),
-                Pend::Read { id, .. } => Some(format!("read of {id} (the seat's cells for it)")),
                 Pend::Cliff { node, .. } => Some(format!("run_cliff on {node} (`result` or `error` from the seat's runner)")),
                 Pend::Done(_) => None,
             }).collect();
@@ -502,6 +486,15 @@ impl Brain {
         if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(live_tail(&t, peer.val_cap() as usize)))?; }   // longer than the cell: its tail, as `live` does; a write that cannot fit must not end the loop
         if !failed && self.error.is_some() { self.error = None; peer.publish(LOOP_ID, "error", &J::Null)?; }
         Ok(())
+    }
+
+    /// Runs a clifflet on the seat's runner (babyseat): writes its code to `membrane::Cliff:<ns>:<call id>`; the answer is `result` or `error` on that node.
+    fn start_cliff(&mut self, peer: &mut Peer, code: &str, call_id: &str) -> Result<Pend, String> {
+        let node = format!("{CLIFF}{}:{call_id}", self.ns);
+        peer.subscribe(Target::Id(node.clone()), None)?;
+        let wid = peer.write(&node, "code", &json!(code))?;
+        self.inflight.insert(wid.clone(), Inflight::Cliff);
+        Ok(Pend::Cliff { node, wid })
     }
 
     /// Starts one tool call. A call that cannot be made says why, in words the model reads as the result.
@@ -523,8 +516,17 @@ impl Brain {
                 let Some(id) = text("id") else { return missing("id") };
                 let Some(props) = a.get("props").and_then(J::as_array) else { return missing("props") };
                 let props: Vec<String> = props.iter().filter_map(J::as_str).map(String::from).collect();
-                peer.subscribe(Target::Id(id.clone()), Some(props.clone()))?;
-                Ok(Pend::Read { id, props })
+                // a clifflet: one dict of `prop` reads; a missing prop or node reads as null. The names go inside single quotes, and no escape is known for the others, so those are refused.
+                let plain = |t: &str| !t.chars().any(|c| c == '\'' || c == '\\' || c.is_control());
+                if !plain(&id) || !props.iter().all(|p| plain(p)) {
+                    return Ok(Pend::Done("error: read cannot take a node id or property with a single quote, a backslash or a control character (they are written inside quotes with no escape); use run_cliff with your own code".into()));
+                }
+                let entries: Vec<String> = props.iter().map(|p| format!("'{p}': prop('{id}', '{p}')")).collect();
+                self.start_cliff(peer, &format!("{{{}}}", entries.join(", ")), call_id)
+            }
+            "run_cliff" => {
+                let Some(code) = text("code") else { return missing("code") };
+                self.start_cliff(peer, &code, call_id)
             }
             "alarm" => {
                 let Some(secs) = a.get("after_seconds").and_then(J::as_f64).filter(|s| *s >= 0.0) else { return missing("after_seconds") };
@@ -537,15 +539,6 @@ impl Brain {
                 peer.publish(&eid, "note", &json!(note))?;
                 self.alarms.push(Alarm { id, at_ms: at, note });
                 Ok(Pend::Done(format!("alarm {id} set for {secs} seconds from now")))
-            }
-            "run_cliff" => {
-                let Some(code) = text("code") else { return missing("code") };
-                // the seat's runner (babyseat) answers on this node: `result`, or `error` in words; the call's own id makes the node
-                let node = format!("{CLIFF}{}:{call_id}", self.ns);
-                peer.subscribe(Target::Id(node.clone()), None)?;
-                let wid = peer.write(&node, "code", &json!(code))?;
-                self.inflight.insert(wid.clone(), Inflight::Cliff);
-                Ok(Pend::Cliff { node, wid })
             }
             other => Ok(Pend::Done(format!("error: there is no tool named `{other}`; the tools are write, read, alarm and run_cliff"))),
         }
