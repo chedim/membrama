@@ -90,7 +90,8 @@ enum Inflight { Write { id: String, prop: String }, System(String), Cliff, Quiet
 enum Pend { Done(String), Wait { id: String, what: String }, Read { id: String, props: Vec<String> }, Cliff { node: String, wid: String } }
 
 /// `slots`: for each pending call, the place of its entry in the trail.
-struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool, owed_shown: Vec<String>, answered: Vec<String> }
+struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool, owed_shown: Vec<String>, answered: Vec<String>, turns: Vec<(String, String)>, call_ids: Vec<String>, issued: Vec<String> }
+
 
 pub struct Brain {
     cfg: BrainConfig,
@@ -285,6 +286,8 @@ impl Brain {
                 for r in self.backlog.drain(..) { delta.push_str(&r.line()); delta.push('\n'); }
             }
             let shown: Vec<String> = self.owed.iter().map(|(m, _, _)| m.clone()).collect();
+            // the person's chat shows a step's calls under each turn it was shown: the turn is the response's eid without `:response`
+            let turns: Vec<(String, String)> = self.owed.iter().map(|(m, r, _)| (m.clone(), r.strip_suffix(":response").unwrap_or(r).to_string())).collect();
             if !self.owed.is_empty() {
                 delta.push_str("Owed (answer each with a write of text to its response node, or write declined with a reason there):\n");
                 for (m, r, t) in &self.owed { delta.push_str(&format!("{m} -> {r}: {t}\n")); }
@@ -294,7 +297,7 @@ impl Brain {
                 delta.push_str("Alarms that went off:\n");
                 for (id, note) in self.fired.drain(..) { delta.push_str(&format!("alarm {id}: {note}\n")); }
             }
-            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], slots: vec![], failed: false, owed_shown: shown, answered: vec![] });
+            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], slots: vec![], failed: false, owed_shown: shown, answered: vec![], turns, call_ids: vec![], issued: vec![] });
             self.trail.clear();
             return self.round(peer, model);
         }
@@ -374,14 +377,44 @@ impl Brain {
         if let Some(step) = &mut self.step { step.messages.push(json!({"role": "assistant", "content": reply.text, "tool_calls": calls})); }
         let mut pending = Vec::new();
         let mut slots = Vec::new();
+        let mut call_ids = Vec::new();
         for (i, c) in reply.tool_calls.iter().enumerate() {
             slots.push(self.trail.len());
+            call_ids.push(self.call_id(round, i));
+            self.show_call(peer, &self.call_id(round, i), c)?;
             self.trail.push(json!({"step": no, "round": round, "tool": c.name, "args": c.arguments}));
             pending.push(self.call(peer, c, &self.call_id(round, i))?);
         }
-        if let Some(step) = &mut self.step { step.pending = pending; step.slots = slots; }
+        if let Some(step) = &mut self.step { step.pending = pending; step.slots = slots; step.call_ids.extend(call_ids); }
         self.record_results(peer)?;
         self.show_waiting(peer)
+    }
+
+    /// Writes one property of the tool row of call `id` under each turn the step was shown (nothing when it was shown none). The seat's answer to a refused write is in `error`.
+    fn write_rows(&mut self, peer: &mut Peer, id: &str, prop: &str, value: J, what: &str) -> Result<(), String> {
+        let turns: Vec<String> = self.step.as_ref().map(|s| s.turns.iter().map(|(_, t)| t.clone()).collect()).unwrap_or_default();
+        for t in turns {
+            let wid = peer.write(&format!("{t}:tool:{id}"), prop, &value)?;
+            self.inflight.insert(wid, Inflight::System(format!("the tool row of a call under {t} ({what})")));
+        }
+        Ok(())
+    }
+
+    /// The call as the person's chat shows it, at the moment it is issued: a row `<turn>:tool:<call id>` with `name` and `input` under each turn the step was shown, and the messages' `tool_ids`
+    /// (the ids in the order called, which is how the chat lists a message's tools, packs/chat.c1f `tool_keys`).
+    fn show_call(&mut self, peer: &mut Peer, id: &str, c: &ToolCall) -> Result<(), String> {
+        let Some(step) = &mut self.step else { return Ok(()) };
+        if step.turns.is_empty() { return Ok(()); }
+        step.issued.push(id.to_string());
+        let ids = step.issued.join(" ");
+        let messages: Vec<String> = step.turns.iter().map(|(m, _)| m.clone()).collect();
+        self.write_rows(peer, id, "name", json!(c.name), "its name")?;
+        self.write_rows(peer, id, "input", c.arguments.clone(), "its input")?;
+        for m in messages {
+            let wid = peer.write(&m, "tool_ids", &json!(ids))?;
+            self.inflight.insert(wid, Inflight::System(format!("the list of the tools of {m}")));
+        }
+        Ok(())
     }
 
     /// A call that was not run: its entry in the trail, with the reason as its result.
@@ -394,13 +427,17 @@ impl Brain {
     fn record_results(&mut self, peer: &mut Peer) -> Result<(), String> {
         let Some(step) = &self.step else { return Ok(()) };
         let no = self.steps + 1;
-        for (p, slot) in step.pending.iter().zip(step.slots.iter()) {
+        let mut rows: Vec<(String, String)> = vec![];
+        let first = step.call_ids.len().saturating_sub(step.pending.len());
+        for (k, (p, slot)) in step.pending.iter().zip(step.slots.iter()).enumerate() {
             let Pend::Done(t) = p else { continue };
             let Some(e) = self.trail.get_mut(*slot) else { continue };
             if e.get("result").is_some() { continue; }
+            if let Some(id) = step.call_ids.get(first + k) { rows.push((id.clone(), t.clone())); }
             eprintln!("membrama: step {no} round {} {} {} -> {t}", e["round"], e["tool"].as_str().unwrap_or(""), e["args"]);
             e["result"] = json!(t);
         }
+        for (id, t) in rows { self.write_rows(peer, &id, "result", json!(t), "its result")?; }
         self.show_trail(peer)
     }
 

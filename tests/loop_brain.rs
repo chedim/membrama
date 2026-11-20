@@ -770,7 +770,7 @@ fn a_call_is_a_tool_row_under_every_turn_the_step_was_shown_at_issue_time_and_it
     r.drive(8);
     let nodes = tool_nodes(&r);
     assert_eq!(nodes.len(), 2, "{nodes:?}");
-    assert!(nodes[0].starts_with("membrane::Chat:main:message:a1:turn:tool:") || nodes[1].starts_with("membrane::Chat:main:message:a1:turn:tool:"));
+    assert!(nodes[0].starts_with("Chat:main:message:a1:turn:tool:") || nodes[1].starts_with("Chat:main:message:a1:turn:tool:"));
     let id = nodes[0].rsplit(':').next().unwrap().to_string();
     assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
     for n in &nodes {
