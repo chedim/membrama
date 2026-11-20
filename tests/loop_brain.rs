@@ -559,3 +559,31 @@ fn two_cliff_calls_in_one_round_and_in_two_steps_use_different_nodes() {
     assert_eq!(all.len(), 3);
     assert!(!nodes.contains(&all[2]), "a later step's call must not reuse a node whose result is already there");
 }
+
+#[test]
+fn every_call_id_is_letters_and_digits_only_and_unique_across_steps_rounds_calls_and_a_restart() {
+    // the seat's runner refuses an id with `:` `-` `_` or `.` (it becomes part of pack names), and never answers it
+    let ok = |id: &str| !id.is_empty() && id.replace([':', '-', '_', '.'], "") == id && id.chars().all(|c| c.is_ascii_alphanumeric());
+    let mut ids: Vec<String> = vec![];
+    for (tag, run) in [("c5", 0), ("c6", 1)] {
+        let mut r = Rig::new(tag, Some("d"), cfg());
+        if run == 1 { std::thread::sleep(std::time::Duration::from_millis(5)); r.brain = Brain::new(cfg(), "membrama"); }
+        r.drive(4);
+        for k in 0..2 {
+            r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"})), ("run_cliff", json!({"code": "2"}))]));
+            r.sim.ext(&format!("Message:{k}"), "text", "x");
+            r.drive(6);
+            let nodes: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.0.clone()).collect();
+            for n in &nodes { r.sim.set_node(n, "result", json!(1)); }
+            r.drive(10);
+        }
+        for (_, m) in r.model.seen.iter().enumerate() { for msg in &m.0 { for c in msg["tool_calls"].as_array().into_iter().flatten() { ids.push(c["id"].as_str().unwrap().to_string()); } } }
+        for w in r.sim.writes.iter().filter(|w| w.1 == "code") { ids.push(w.0.rsplit(':').next().unwrap().to_string()); }
+    }
+    assert!(!ids.is_empty());
+    for id in &ids { assert!(ok(id), "{id}"); }
+    let mut nodes: Vec<&String> = ids.iter().collect();
+    nodes.sort(); nodes.dedup();
+    // the two runs each made 4 distinct calls: the same step/round/call positions in a second run must not repeat an id
+    assert!(nodes.len() >= 8, "{nodes:?}");
+}
