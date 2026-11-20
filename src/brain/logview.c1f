@@ -9,8 +9,8 @@ IMPORT shell_view 1
 --   on open       one ask (`n` only, from 0), read `head`; then ask from max(0, head - (200 - 1)), so the page shows the last 200 lines
 --   on the tick   the shell's own (`Shell.tick`, at the shell's `status_ms`), only while the tab is active: ask from the line after the last one shown (a new `n`), read `rows`, append, keep the last 200
 -- 200 is the seat's own page size (packs/logview.c1f). The three calls of an ask are `Fetch:mlog:from`, `Fetch:mlog:n`, `Fetch:mlog:read`, one POST each, chained by their receipts. A call that fails is `MLog:main.note`,
--- shown on the tab. The guard pack removes this tab when membrama's link is not up.
---   MLog:main   `phase` (None, 'head', 'follow'), `step` (from, n, read, headread), `last` (the number of the last line shown), `lines`, `seq`, `polling`, `last_poll`, `note`
+-- shown on the tab. The tab scrolls (`panelrows`) and stays at the bottom unless the person scrolled up (`near`, by the chat's own `stick_px`); "Load older lines" puts the 200 lines before the first one above it. The guard pack removes this tab when membrama's link is not up.
+--   MLog:main   `first` (the number of the first line shown), `pages` (loads the person asked for: the cap of lines is 200 x pages), `more`, `near`, `holding`, `older_out`, `phase` (None, 'head', 'follow'), `step` (from, n, read, headread), `last` (the number of the last line shown), `lines`, `seq`, `polling`, `last_poll`, `note`
 
 Shell.open on-setter membrama-log-register:
   WHEN this.open:
@@ -19,19 +19,52 @@ Shell.open on-setter membrama-log-register:
 
 Nav.active on-setter membrama-log-draw:
   WHEN this.eid == 'Nav:membrama_log' and this.active == True:
-    ('DomNode:mlog:root').tag = 'pre'
+    ('DomNode:mlog:root').tag = 'div'
+    ('DomNode:mlog:root').class = 'panelrows'
     ('DomNode:mlog:root').parent = 'DomNode:shell:slot:membrama_log'
+    ('DomNode:mlog:older').parent = 'DomNode:mlog:root'
+    ('DomNode:mlog:older').tag = 'div'
+    ('DomNode:mlog:older').hidden = True
+    ('DomNode:mlog:older:btn').parent = 'DomNode:mlog:older'
+    ('DomNode:mlog:older:btn').tag = 'button'
+    ('DomNode:mlog:older:btn').type = 'button'
+    ('DomNode:mlog:older:btn').text = 'Load older lines'
+    ('DomNode:mlog:text').parent = 'DomNode:mlog:root'
+    ('DomNode:mlog:text').tag = 'pre'
     ('Nav:membrama_log').filled = True
     ('MLog:main').on = True
 
 MLog.ns getter: prop('Link:page', 'ns')
 MLog.text getter: join(this.lines or [], '\n') + (('\n' if this.lines else '') + str(this.note) if this.note else '')
-MLog.text on-setter membrama-log-text:
+-- the button shows while there are older lines than the first one shown
+MLog.more getter: this.first != None and this.first > 0
+MLog.more on-setter membrama-log-more:
   WHEN this.on == True:
-    ('DomNode:mlog:root').text = this.text
+    ('DomNode:mlog:older').hidden = not this.more
+-- the lines are kept at the bottom after they are drawn, unless the person scrolled up (`near` false; no scroll seen yet counts as near) or older lines were just put above (`holding`)
+MLog.text on-setter membrama-log-text:
+  WHEN this.on == True and this.near != False and not this.holding:
+    ('DomNode:mlog:text').text = this.text
+    ('DomNode:mlog:root').scroll = 'end'
+  ELSE WHEN this.on == True:
+    ('DomNode:mlog:text').text = this.text
 MLog.on on-setter membrama-log-first:
   WHEN this.on == True:
-    ('DomNode:mlog:root').text = this.text
+    ('DomNode:mlog:text').text = this.text
+-- near the bottom within the chat's own `stick_px` (the owner's number); a pack write of `scroll` (the command 'end', no height) is not a measure; no chat view counts as near
+DomNode.scroll on-setter membrama-log-scroll:
+  WHEN this.eid == 'DomNode:mlog:root' and prop(this.scroll, 'height') != None:
+    ('MLog:main').near = prop('View:chat', 'stick_px') == None or prop(this.scroll, 'height') - prop(this.scroll, 'top') - prop(this.scroll, 'client') < prop('View:chat', 'stick_px')
+-- "Load older lines": the page before the first one shown (200 lines, the seat's page size); the same chain of calls, asked from max(0, first - 200)
+DomNode.clicked on-setter membrama-log-older-click:
+  WHEN this.eid == 'DomNode:mlog:older:btn' and not prop('MLog:main', 'polling') and prop('MLog:main', 'more') == True:
+    n = (prop('MLog:main', 'seq') or 0) + 1
+    ('MLog:main').seq = n
+    ('MLog:main').polling = True
+    ('MLog:main').older_out = True
+    ('MLog:main').holding = True
+    ('MLog:main').step = 'from'
+    ('Fetch:mlog:from').request = {'timeout_s': 10, 'id': 'mlog-from-' + str(n), 'url': '/mcp', 'method': 'POST', 'headers': {'content-type': 'application/json'}, 'body': str({'jsonrpc': '2.0', 'id': n, 'method': 'tools/call', 'params': {'name': 'entity_write', 'arguments': {'spec': prop('MLog:main', 'ns') + '::LogAsk:main', 'prop': 'from', 'value': max(0, prop('MLog:main', 'first') - 200)}}})}
 
 -- the receipt of a call, read once: ok = the seat answered 2xx and the call has no error; `text` is what the door's tool answered
 Fetch.mq getter:
@@ -74,15 +107,29 @@ Fetch.mq on-setter membrama-log-step:
   ELSE WHEN this.eid == 'Fetch:mlog:read' and this.mq != None and prop('MLog:main', 'step') == 'headread':
     hd = num(str(prop(this.mq, 'text') or ''))
     ('MLog:main').last = (max(0, hd - 199) - 1) if hd is Number else -1
+    ('MLog:main').first = (max(0, hd - 199)) if hd is Number else 0
     ('MLog:main').phase = 'follow'
     ('MLog:main').note = None
     ('MLog:main').polling = False
     ('MLog:main').last_poll = 0
+  ELSE WHEN this.eid == 'Fetch:mlog:read' and this.mq != None and prop('MLog:main', 'step') == 'read' and prop('MLog:main', 'older_out') == True:
+    rs = json(str(prop(this.mq, 'text') or ''))
+    ow = [r for r in (rs if rs is List else []) if prop(r, 'n') < prop('MLog:main', 'first')]
+    ('MLog:main').older_out = False
+    ('MLog:main').pages = (prop('MLog:main', 'pages') or 1) + 1
+    ('MLog:main').first = min([prop(r, 'n') for r in ow]) if len(ow) > 0 else prop('MLog:main', 'first')
+    ('MLog:main').lines = concat([str(prop(r, 'n')) + ' ' + str(prop(r, 'eid')) + '.' + str(prop(r, 'prop')) + ' ' + str(prop(r, 'op')) + ' by ' + str(prop(r, 'writer')) for r in ow], prop('MLog:main', 'lines') or [])
+    ('MLog:main').note = None
+    ('MLog:main').polling = False
+    ('MLog:main').last_poll = clock
   ELSE WHEN this.eid == 'Fetch:mlog:read' and this.mq != None and prop('MLog:main', 'step') == 'read':
     rs = json(str(prop(this.mq, 'text') or ''))
     rw = [r for r in (rs if rs is List else []) if prop(r, 'n') > (prop('MLog:main', 'last') if prop('MLog:main', 'last') != None else -1)]
-    ('MLog:main').lines = tail(concat(prop('MLog:main', 'lines') or [], [str(prop(r, 'n')) + ' ' + str(prop(r, 'eid')) + '.' + str(prop(r, 'prop')) + ' ' + str(prop(r, 'op')) + ' by ' + str(prop(r, 'writer')) for r in rw]), 200)
+    ('MLog:main').holding = False
+    nl = tail(concat(prop('MLog:main', 'lines') or [], [str(prop(r, 'n')) + ' ' + str(prop(r, 'eid')) + '.' + str(prop(r, 'prop')) + ' ' + str(prop(r, 'op')) + ' by ' + str(prop(r, 'writer')) for r in rw]), 200 * (prop('MLog:main', 'pages') or 1))
     ('MLog:main').last = max([prop(r, 'n') for r in rw]) if len(rw) > 0 else prop('MLog:main', 'last')
+    ('MLog:main').first = (max([prop(r, 'n') for r in rw]) - len(nl) + 1) if len(rw) > 0 else prop('MLog:main', 'first')
+    ('MLog:main').lines = nl
     ('MLog:main').note = None
     ('MLog:main').polling = False
     ('MLog:main').last_poll = clock
