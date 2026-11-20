@@ -26,6 +26,8 @@ struct Sim {
     refuse: Option<String>,
     /// refuse only the writes to nodes whose id holds this text
     refuse_for: Option<String>,
+    /// the seat's Cliff runner answers a read-shaped clifflet with this error instead of its value
+    cliff_error: Option<String>,
     reader: Option<CellsReader>,
     served_n: f64,
     /// the LogView's page does not fit the peer's table: the cell is Refused, as the seat's driver writes it
@@ -36,7 +38,7 @@ impl Sim {
     fn new(tag: &str, doctrine: Option<&str>) -> (Sim, Peer) {
         let seat = FakeSeat::start(tag);
         let mut peer = seat.peer();
-        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], prefix_subs: vec![], refuse: None, refuse_for: None, reader: None, served_n: -1.0, rows_too_big: false };
+        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], prefix_subs: vec![], refuse: None, refuse_for: None, cliff_error: None, reader: None, served_n: -1.0, rows_too_big: false };
         if let Some(d) = doctrine { sim.nodes.entry(DOCTRINE_ID.into()).or_default().insert("text".into(), json!(d)); }
         sim.pump(&mut peer);
         (sim, peer)
@@ -60,6 +62,18 @@ impl Sim {
         self.seat.put(eid, "", json!(true));
         for (k, v) in props { self.seat.put(eid, &k, v); }
     }
+    /// The seat's runner for the one clifflet shape the read tool writes, `{'p': prop('N', 'p'), ...}`: a dict of the props, null for what is not there; other code is left to the test.
+    fn run_read_clifflet(&mut self, node: &str, code: &str) {
+        if !code.starts_with("{'") { return; }
+        if let Some(e) = self.cliff_error.clone() { self.set_node(node, "error", json!(e)); return; }
+        let mut m = serde_json::Map::new();
+        for part in code.split("prop('").skip(1) {
+            let (n, rest) = part.split_once("', '").unwrap();
+            let p = rest.split_once("')").unwrap().0;
+            m.insert(p.to_string(), self.nodes.get(n).and_then(|x| x.get(p)).cloned().unwrap_or(J::Null));
+        }
+        self.set_node(node, "result", J::Object(m));
+    }
     fn on_op(&mut self, op: Op, out: &mut Vec<Op>) {
         match op {
             Op::Sub { target: Target::Id(id), .. } => { self.subs.push(id.clone()); self.publish_node(&id); }
@@ -75,6 +89,7 @@ impl Sim {
                 self.nodes.entry(id.clone()).or_default().insert(prop.clone(), value.clone());
                 self.log(&id, &prop, "link:membrama", value.to_string().len());
                 if self.subs.contains(&id) { self.publish_node(&id); }
+                if id.starts_with("membrane::Cliff:") && prop == "code" { self.run_read_clifflet(&id, value.as_str().unwrap_or("")); }
                 out.push(Op::Res { wid, refused: None });
             }
             // the real seat answers `wr` and publishes what is subscribed; it does not answer `read` or `query` ops (cliffvm peers.rs)
@@ -300,16 +315,43 @@ fn the_read_tool_gets_the_value_from_the_seat_and_the_model_continues_with_it() 
 }
 
 #[test]
-fn read_gets_the_props_from_the_cells_the_seat_publishes_and_a_missing_node_is_told() {
+fn read_is_a_clifflet_on_the_seats_runner_and_a_missing_prop_or_node_is_null() {
     let mut r = Rig::new("l13", Some("d"), cfg());
     r.drive(4);
     r.sim.nodes.entry("Room:a".into()).or_default().insert("t".into(), json!(1));
-    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a", "props": ["t"]})), ("read", json!({"id": "Room:none", "props": ["t"]}))]));
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a", "props": ["t", "u"]})), ("read", json!({"id": "Room:none", "props": ["t"]}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(14);
+    let codes: Vec<J> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.2.clone()).collect();
+    assert_eq!(codes[0], json!("{'t': prop('Room:a', 't'), 'u': prop('Room:a', 'u')}"));
+    let told: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert_eq!(told[0], r#"{"t":1,"u":null}"#, "{told:?}");
+    assert_eq!(told[1], r#"{"t":null}"#, "a missing node is null per prop, not claimed to be gone: {told:?}");
+}
+
+#[test]
+fn read_refuses_an_id_or_prop_it_cannot_write_into_a_clifflet_and_says_why() {
+    let mut r = Rig::new("l13c", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a'b", "props": ["t"]})), ("read", json!({"id": "Room:a", "props": ["t\\x"]})), ("read", json!({"id": "Room:a", "props": ["line\nbreak"]}))]));
     r.sim.ext("Message:1", "text", "x");
     r.drive(10);
+    assert!(r.sim.writes.iter().all(|w| w.1 != "code"), "nothing was sent to the seat");
     let told: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
-    assert!(told[0].contains("\"t\":1"), "{told:?}");
-    assert!(told[1].contains("no such node"), "{told:?}");
+    assert_eq!(told.len(), 3);
+    for t in &told { assert!(t.starts_with("error:") && t.contains("quote") , "{t}"); }
+}
+
+#[test]
+fn the_runners_error_for_a_read_is_the_tool_result() {
+    let mut r = Rig::new("l13d", Some("d"), cfg());
+    r.drive(4);
+    r.sim.cliff_error = Some("refused: node not readable by this peer".into());
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a", "props": ["t"]}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(10);
+    let told = r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().to_string();
+    assert!(told.starts_with("error:") && told.contains("not readable"), "{told}");
 }
 
 #[test]
