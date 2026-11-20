@@ -222,7 +222,7 @@ fn an_outside_change_wakes_a_step_told_doctrine_and_delta_with_pointers_not_valu
     assert!(u.contains("person:1"), "the delta says who wrote it: {u}");
     assert!(!u.contains("SECRET-BODY"), "pointers only, the model reads the value itself: {u}");
     let names: Vec<&str> = tools.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["write", "read", "query", "alarm"]);
+    assert_eq!(names, vec!["write", "read", "query", "alarm", "run_cliff"]);
 }
 
 #[test]
@@ -483,7 +483,7 @@ fn run_cliff_is_one_of_the_tools_and_takes_code() {
 
 #[test]
 fn run_cliff_writes_the_code_to_a_cliff_node_and_the_result_is_the_tool_result() {
-    let mut r = Rig::new("l20", Some("d"), cfg());
+    let mut r = Rig::new("c1", Some("d"), cfg());
     r.drive(4);
     r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1 + 1"}))]));
     r.sim.ext("Message:1", "text", "x");
@@ -505,7 +505,7 @@ fn run_cliff_writes_the_code_to_a_cliff_node_and_the_result_is_the_tool_result()
 
 #[test]
 fn run_cliff_tells_the_runners_error_text() {
-    let mut r = Rig::new("l21", Some("d"), cfg());
+    let mut r = Rig::new("c2", Some("d"), cfg());
     r.drive(4);
     r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "boom("}))]));
     r.sim.ext("Message:1", "text", "x");
@@ -520,7 +520,7 @@ fn run_cliff_tells_the_runners_error_text() {
 
 #[test]
 fn run_cliff_refused_write_and_missing_code_are_told_not_waited_for() {
-    let mut r = Rig::new("l22", Some("d"), cfg());
+    let mut r = Rig::new("c3", Some("d"), cfg());
     r.drive(4);
     r.model.script.push_back(calls(vec![("run_cliff", json!({}))]));
     r.sim.ext("Message:1", "text", "x");
@@ -536,7 +536,7 @@ fn run_cliff_refused_write_and_missing_code_are_told_not_waited_for() {
 
 #[test]
 fn two_cliff_calls_in_one_round_and_in_two_steps_use_different_nodes() {
-    let mut r = Rig::new("l23", Some("d"), cfg());
+    let mut r = Rig::new("c4", Some("d"), cfg());
     r.drive(4);
     r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"})), ("run_cliff", json!({"code": "2"}))]));
     r.sim.ext("Message:1", "text", "x");

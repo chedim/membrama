@@ -124,6 +124,9 @@ impl Peer {
         self.ctl.send(&frame).map_err(|e| format!("the control rings: {e:?}"))
     }
 
+    /// Tells the seat to stop publishing a node it was asked to.
+    pub fn unsubscribe(&mut self, target: Target) -> Result<(), String> { self.send_ops(vec![Op::Unsub { target }]) }
+
     /// The latest value of a cell the seat published, or `None` when it is not there (or is gone or refused).
     pub fn read(&self, eid: &str, prop: &str) -> Result<Option<J>, String> {
         Ok(self.seat.get(&cell_key(eid, prop), self.spins, self.depth)?.filter(|c| c.state == CellState::Live).map(|c| c.value))
