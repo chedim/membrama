@@ -587,3 +587,54 @@ fn every_call_id_is_letters_and_digits_only_and_unique_across_steps_rounds_calls
     // the two runs each made 4 distinct calls: the same step/round/call positions in a second run must not repeat an id
     assert!(nodes.len() >= 8, "{nodes:?}");
 }
+
+// ---- the trail of the last step: `Loop:main.trail`
+
+fn trail(r: &Rig) -> Vec<J> { r.own(LOOP_ID, "trail").and_then(|v| v.as_array().cloned()).unwrap_or_default() }
+
+#[test]
+fn the_trail_has_each_rounds_visible_text_and_each_tool_call_with_whole_args_and_result() {
+    let mut r = Rig::new("t1", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(Ok(Reply { text: "<think>hidden</think>looking at it".into(), tool_calls: vec![ToolCall { name: "read".into(), arguments: json!({"id": "Message:7", "props": ["text"]}) }] }));
+    r.model.script.push_back(Ok(Reply { text: "all done".into(), tool_calls: vec![] }));
+    r.sim.ext("Message:7", "text", "THE-WHOLE-BODY");
+    r.drive(10);
+    let t = trail(&r);
+    assert_eq!(t.len(), 3, "{t:?}");
+    assert_eq!(t[0], json!({"step": 1, "round": 1, "text": "looking at it"}));
+    assert_eq!(t[1]["tool"], "read");
+    assert_eq!(t[1]["args"], json!({"id": "Message:7", "props": ["text"]}));
+    assert!(t[1]["result"].as_str().unwrap().contains("THE-WHOLE-BODY"));
+    assert_eq!(t[2], json!({"step": 1, "round": 2, "text": "all done"}));
+}
+
+#[test]
+fn the_trail_is_the_last_step_only_and_a_call_not_run_at_the_round_limit_is_in_it_as_not_run() {
+    let mut r = Rig::new("t2", Some("d"), BrainConfig { max_rounds: 1, ..cfg() });
+    r.drive(4);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    assert_eq!(trail(&r).len(), 1, "round 1 said nothing and has no call");
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "n"}))]));
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(6);
+    let t = trail(&r);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert_eq!(t[0]["step"], 2);
+    assert!(t[0]["result"].as_str().unwrap().contains("not run"), "{t:?}");
+}
+
+#[test]
+fn a_trail_that_does_not_fit_the_peers_cell_drops_the_oldest_entries_and_says_how_many() {
+    let mut r = Rig::new("t3", Some("d"), BrainConfig { max_rounds: 40, ..cfg() });
+    r.drive(4);
+    let big = "y".repeat(1000);
+    for _ in 0..8 { r.model.script.push_back(calls(vec![("write", json!({"id": "Note:1", "prop": "p", "value": big}))])); }
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(60);
+    let t = trail(&r);
+    assert!(t[0]["dropped"].as_u64().unwrap() > 0, "{:?}", t.first());
+    assert!(serde_json::to_string(&t).unwrap().len() <= r.peer.val_cap() as usize);
+    assert!(t.last().unwrap()["tool"] == "write", "the newest entries are kept");
+}
