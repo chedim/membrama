@@ -166,10 +166,14 @@ fn on_connect_the_loop_writes_the_log_viewer_and_the_guard_to_the_seat_as_packs(
 }
 
 #[test]
-fn the_viewer_is_a_tab_and_the_guard_removes_both_when_the_link_is_not_up() {
+fn the_viewer_is_a_section_of_the_seats_log_tab_and_the_guard_removes_both_when_the_link_is_not_up() {
     let v = viewer_pack("membrama");
-    for want in ["PACK membrama_logview", "IMPORT dom 1", "IMPORT shell_view 1", "('Nav:membrama_log').title", "DomNode:shell:slot:membrama_log", "('Nav:membrama_log').filled = True"] {
-        assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
+    // the section of the seat's tab: drawn into the seat's root once the seat's tab has drawn, never a tab of its own
+    for want in ["PACK membrama_logview", "IMPORT dom 1", "IMPORT shell_view 1", "Nav.filled on-setter", "this.eid == 'Nav:log'", "('DomNode:mloop:chat').parent = 'DomNode:log:root'", "('DomNode:mloop:head').parent = 'DomNode:log:root'"] {
+        assert!(v.contains(want), "the loop's section should contain {want:?}:\n{v}");
+    }
+    for never in ["('Nav:log').title", "('Nav:log').filled", "DomNode:shell:slot:", "('DomNode:log:root').", "LogAsk", "LogView"] {
+        assert!(!v.contains(never), "the loop's section must not write the seat's tab or ask for the seat's log ({never:?}):\n{v}");
     }
     let g = guard_pack("membrama");
     for want in ["PACK membrama_logguard", "Vm:membrama", "!= 'up'", "('Pack:membrama_logview').text = None", "('Pack:membrama_logguard').text = None"] {
@@ -181,23 +185,14 @@ fn the_viewer_is_a_tab_and_the_guard_removes_both_when_the_link_is_not_up() {
 }
 
 #[test]
-fn the_tab_asks_for_its_own_view_by_the_door_and_never_reads_the_logview_by_link() {
-    let v = viewer_pack("membrama");
-    // the view is virtual and a link does not carry it: no read of it by `prop(...)`, no namespace baked in
-    assert!(!v.contains("prop('membrane::LogView"), "the tab must not read the LogView through the link:\n{v}");
-    assert!(!v.contains("@NS@") && !v.contains("membrama::"), "the tab asks in the page's own namespace:\n{v}");
-    for want in ["IMPORT fetch 1", "'::LogAsk:main'", "'membrane::LogView:'", "entity_write", "entity_read", "'rows'", "'head'", "'from'", "'n'",
-                 "Link:page", "'ns'", "Shell.tick on-setter", "Nav:membrama_log", "200", "max(0,", "Fetch:mlog:"] {
-        assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
+fn the_loop_section_reads_its_own_raw_chat_by_the_door_while_the_seats_tab_is_in_front() {
+    let v = viewer_pack("brain2");
+    for want in ["IMPORT fetch 1", "'spec': 'brain2::Loop:main', 'prop': 'chat'", "'entity_read'", "Fetch:mloop:read", "Shell.tick on-setter", "prop('Nav:log', 'active') == True", "('DomNode:mloop:chat').text = this.full", "Fetch.ml getter"] {
+        assert!(v.contains(want), "the loop's section should contain {want:?}:\n{v}");
     }
-    // follows only while the tab is the active one
-    assert!(v.contains("prop('Nav:membrama_log', 'active') == True"), "{v}");
-    // scrollable, kept at the bottom, loads older lines in pages
-    for want in ["'panelrows'", "scroll = 'end'", "View:chat', 'stick_px'", "DomNode:mlog:older:btn", "Load older lines", "'older_out'", "max(0, prop('MLog:main', 'first') - 200)", "200 * (prop('MLog:main', 'pages') or 1)", "prop(r, 'n') < prop('MLog:main', 'first')"] {
-        assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
-    }
-    // a line is `n eid.prop op by writer`
-    assert!(v.contains("' by '"), "{v}");
+    assert!(!v.contains("@NS@") && !v.contains("membrama::"), "every namespace slot is filled with the peer's own:\n{v}");
+    // the seat's own receipt reader (`Fetch.mq`) is not shadowed: this pack reads its receipt with its own getter
+    assert!(!v.contains("Fetch.mq"), "{v}");
 }
 
 #[test]
@@ -912,5 +907,37 @@ fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker(
     assert!(model.partials.iter().all(|p| serde_json::to_string(p).unwrap().len() <= cap), "never above val_cap");
     let last = model.partials.last().unwrap();
     assert!(last.starts_with("[\u{2026}earlier text dropped]\n") && last.ends_with("THE-END"), "{}", &last[..40]);
+}
+
+// ---- the raw chat with the model: `Loop:main.chat`
+
+fn chat(r: &Rig) -> String { r.own(LOOP_ID, "chat").and_then(|v| v.as_str().map(String::from)).unwrap_or_default() }
+
+#[test]
+fn the_chat_is_the_raw_exchange_prompt_reply_with_its_thinking_calls_and_results() {
+    let mut r = Rig::new("rc1", Some("THE-DOCTRINE"), cfg());
+    r.drive(4);
+    r.model.script.push_back(Ok(Reply { text: "<think>hidden thought</think>looking".into(), tool_calls: vec![ToolCall { name: "read".into(), arguments: json!({"id": "Message:7", "props": ["text"]}) }] }));
+    r.model.script.push_back(Ok(Reply { text: "all done".into(), tool_calls: vec![] }));
+    r.sim.ext("Message:7", "text", "THE-BODY");
+    r.drive(10);
+    let c = chat(&r);
+    let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s:?} is not in the chat: {c}"));
+    // in the order they happened
+    assert!(at("THE-DOCTRINE") < at("Message:7") && at("hidden thought") < at("THE-BODY") && at("THE-BODY") < at("all done"), "{c}");
+    assert!(c.contains("<think>hidden thought</think>"), "the reply is raw, thinking included: {c}");
+}
+
+#[test]
+fn the_chat_keeps_earlier_steps_and_drops_the_oldest_text_first_when_the_cell_is_full() {
+    let mut r = Rig::new("rc2", Some("d"), cfg());
+    r.drive(4);
+    for k in 0..40 { r.model.script.push_back(Ok(Reply { text: format!("answer-{k}-{}", "z".repeat(300)), tool_calls: vec![] })); }
+    for k in 0..40 { r.sim.ext(&format!("Message:{k}"), "text", "x"); r.drive(6); }
+    let c = chat(&r);
+    assert!(serde_json::to_string(&c).unwrap().len() <= r.peer.val_cap() as usize, "never above val_cap");
+    assert!(c.starts_with("[\u{2026}earlier text dropped]\n"), "{}", &c[..40.min(c.len())]);
+    assert!(c.contains("answer-39-"), "the newest is kept");
+    assert!(!c.contains("answer-0-"), "the oldest went first");
 }
 

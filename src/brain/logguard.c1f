@@ -1,7 +1,7 @@
 PACK membrama_logguard 1
 IMPORT link 1
 -- THE GUARD (written to the seat by membrama when it connects, `Pack:membrama_logguard.text`; it imports nothing the page alone provides, so the seat runs it). When membrama's link is not up (`Vm:@NS@.link`:
--- gone, or anything but up) it removes the log tab and itself, by writing `Pack:<name>.text = None`, so nothing of membrama's stays loaded on the seat or the page.
+-- gone, or anything but up) it removes the loop's section of the log tab and itself, by writing `Pack:<name>.text = None`, so nothing of membrama's stays loaded on the seat or the page.
 
 Vm.link on-setter membrama-logguard:
   WHEN this.eid == 'Vm:@NS@' and this.link != 'up':
