@@ -709,9 +709,7 @@ fn an_alarm_step_is_offered_what_is_still_owed_and_nothing_owed_has_no_section()
     assert!(!user(&r.model.seen[0]).contains(HEAD));
     r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 0.05, "note": "retry"}))]));
     owed(&mut r, &["a1"]);
-    r.drive(8);
-    let n = r.model.seen.len();
-    r.drive(20);
-    assert!(r.model.seen.len() > n, "the alarm woke a step");
+    r.drive(30);
+    assert_eq!(r.model.seen.len(), 4, "model calls: the first step, the owed step (two rounds: the alarm call and its result), the alarm step");
     assert!(user(r.model.seen.last().unwrap()).contains("message:a1 "));
 }

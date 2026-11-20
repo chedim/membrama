@@ -45,6 +45,8 @@ pub const DOCTRINE_DRAFT: &str = include_str!("brain/doctrine.md");
 /// The loop's own node in membrama's namespace: `cursor`, `steps`, `said` (the last words of a step) and `error` (what last went wrong, in plain words; null when the last step was clean).
 pub const LOOP_ID: &str = "membrama::Loop:main";
 const ASK_ID: &str = "membrama::LogAsk:main";
+/// The seat's node of what it owes this peer: `items`, oldest first, `{message, response}` (the answer goes to the response node as a write of `text`, or `declined` with a reason).
+fn owed_id(ns: &str) -> String { format!("membrane::Owed:{ns}") }
 const ALARM: &str = "membrama::Alarm:";
 /// The seat's node a clifflet is run on: `membrane::Cliff:<ns>:<call id>` (the peer writes `code`; the seat's runner writes `result` or `error`).
 const CLIFF: &str = "membrane::Cliff:";
@@ -88,7 +90,7 @@ enum Inflight { Write { id: String, prop: String }, System(String), Cliff, Quiet
 enum Pend { Done(String), Wait { id: String, what: String }, Read { id: String, props: Vec<String> }, Cliff { node: String, wid: String } }
 
 /// `slots`: for each pending call, the place of its entry in the trail.
-struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool }
+struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool, owed_shown: Vec<String>, answered: Vec<String> }
 
 pub struct Brain {
     cfg: BrainConfig,
@@ -115,6 +117,12 @@ pub struct Brain {
     run: String,
     waiting: Option<String>,
     /// the last step's trail: for each round the model's visible text, for each tool call `{step, round, tool, args, result}`
+    /// what the seat says it owes now: `(message, response)`
+    owed: Vec<(String, String)>,
+    /// the messages of the last set seen, to tell a new item from one already there
+    owed_known: Vec<String>,
+    /// a new item came and no step has started since
+    owed_wake: bool,
     trail: Vec<J>,
     published_trail: Option<String>,
 }
@@ -126,7 +134,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, trail: vec![], published_trail: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, owed: vec![], owed_known: vec![], owed_wake: false, trail: vec![], published_trail: None,
         }
     }
 
@@ -136,6 +144,7 @@ impl Brain {
         self.absorb(peer, events);
         if !peer.is_open() { return Ok(()); }
         self.connect(peer)?;
+        self.read_owed(peer)?;
         self.read_log(peer)?;
         self.fire_alarms(peer)?;
         self.run(peer, model)
@@ -153,6 +162,7 @@ impl Brain {
                 Some(Inflight::System(what)) => { if let Some(why) = text.strip_prefix("refused: ") { self.fail(peer, &format!("the seat refused {what}: {why}")); } }
                 Some(Inflight::Write { id: eid, prop }) => {
                     if let Some(why) = text.strip_prefix("refused: ") { self.fail(peer, &format!("write to {eid}.{prop} refused: {why}")); }
+                    else if prop == "text" || prop == "declined" { if let Some(s) = &mut self.step { s.answered.push(eid.clone()); } }
                     self.answers.insert(id, text);
                 }
                 // the write of a cliff's code: an ok says nothing (the result comes on the node), a refusal ends the call
@@ -177,6 +187,7 @@ impl Brain {
         if !self.subscribed {
             peer.subscribe(Target::Id(format!("membrane::LogView:{}", self.ns)), None)?;
             peer.subscribe(Target::Id(DOCTRINE_ID.into()), None)?;
+            peer.subscribe(Target::Id(owed_id(&self.ns)), None)?;
             for (pack, text, what) in [(GUARD_PACK, guard_pack(&self.ns), "the guard pack"), (VIEWER_PACK, viewer_pack(&self.ns), "the log tab pack")] {
                 let wid = peer.write(&format!("Pack:{pack}"), "text", &json!(text))?;
                 self.inflight.insert(wid, Inflight::System(what.into()));
@@ -231,6 +242,16 @@ impl Brain {
         Ok(())
     }
 
+    /// What the seat owes: an item not in the last set seen is new and wakes a step; the set is kept so a step can be shown all of it.
+    fn read_owed(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let Seen::Live(items) = peer.seen(&owed_id(&self.ns), "items")? else { return Ok(()) };
+        let now: Vec<(String, String)> = items.as_array().into_iter().flatten().filter_map(|i| Some((i.get("message")?.as_str()?.to_string(), i.get("response")?.as_str()?.to_string()))).collect();
+        if now.iter().any(|(m, _)| !self.owed_known.contains(m)) { self.owed_wake = true; }
+        self.owed_known = now.iter().map(|(m, _)| m.clone()).collect();
+        self.owed = now;
+        Ok(())
+    }
+
     fn fire_alarms(&mut self, peer: &mut Peer) -> Result<(), String> {
         let (due, later): (Vec<Alarm>, Vec<Alarm>) = std::mem::take(&mut self.alarms).into_iter().partition(|a| a.at_ms <= self.now);
         self.alarms = later;
@@ -239,7 +260,7 @@ impl Brain {
     }
 
     /// A step starts on an outside change (a line that is not the loop's own) or an alarm, and only then.
-    fn wakes(&self) -> bool { !self.fired.is_empty() || self.backlog.iter().any(|r| !r.own) }
+    fn wakes(&self) -> bool { self.owed_wake || !self.fired.is_empty() || self.backlog.iter().any(|r| !r.own) }
 
     fn run(&mut self, peer: &mut Peer, model: &mut dyn Model) -> Result<(), String> {
         if self.step.is_none() {
@@ -255,11 +276,17 @@ impl Brain {
                 delta.push_str("Graph changes since your last step (pointers only; read a node to see its value):\n");
                 for r in self.backlog.drain(..) { delta.push_str(&r.line()); delta.push('\n'); }
             }
+            let shown: Vec<String> = self.owed.iter().map(|(m, _)| m.clone()).collect();
+            if !self.owed.is_empty() {
+                delta.push_str("Owed (answer each with a write of text to its response node, or write declined with a reason there):\n");
+                for (m, r) in &self.owed { delta.push_str(&format!("{m} -> {r}\n")); }
+            }
+            self.owed_wake = false;
             if !self.fired.is_empty() {
                 delta.push_str("Alarms that went off:\n");
                 for (id, note) in self.fired.drain(..) { delta.push_str(&format!("alarm {id}: {note}\n")); }
             }
-            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], slots: vec![], failed: false });
+            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], slots: vec![], failed: false, owed_shown: shown, answered: vec![] });
             self.trail.clear();
             return self.round(peer, model);
         }
@@ -402,6 +429,12 @@ impl Brain {
     }
 
     fn finish(&mut self, peer: &mut Peer, said: Option<String>) -> Result<(), String> {
+        // an item this step was shown that is still owed, and that the step did not answer or decline, is never dropped silently
+        let open: Vec<String> = match &self.step {
+            Some(s) => self.owed.iter().filter(|(m, r)| s.owed_shown.contains(m) && !s.answered.contains(r)).map(|(m, _)| m.clone()).collect(),
+            None => vec![],
+        };
+        if !open.is_empty() { self.fail(peer, &format!("the step ended with {} owed items still open: {}", open.len(), open.join(", "))); }
         let failed = self.step.take().map(|s| s.failed).unwrap_or(false);
         self.show_waiting(peer)?;
         self.steps += 1;
