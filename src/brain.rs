@@ -118,7 +118,9 @@ pub struct Brain {
     waiting: Option<String>,
     /// the last step's trail: for each round the model's visible text, for each tool call `{step, round, tool, args, result}`
     /// what the seat says it owes now: `(message, response)`
-    owed: Vec<(String, String)>,
+    owed: Vec<(String, String, String)>,
+    /// the banner text the seat hands over with what it owes
+    banner: String,
     /// the messages of the last set seen, to tell a new item from one already there
     owed_known: Vec<String>,
     /// a new item came and no step has started since
@@ -134,7 +136,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, owed: vec![], owed_known: vec![], owed_wake: false, trail: vec![], published_trail: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, owed: vec![], banner: String::new(), owed_known: vec![], owed_wake: false, trail: vec![], published_trail: None,
         }
     }
 
@@ -162,7 +164,11 @@ impl Brain {
                 Some(Inflight::System(what)) => { if let Some(why) = text.strip_prefix("refused: ") { self.fail(peer, &format!("the seat refused {what}: {why}")); } }
                 Some(Inflight::Write { id: eid, prop }) => {
                     if let Some(why) = text.strip_prefix("refused: ") { self.fail(peer, &format!("write to {eid}.{prop} refused: {why}")); }
-                    else if prop == "text" || prop == "declined" { if let Some(s) = &mut self.step { s.answered.push(eid.clone()); } }
+                    let mut text = text;
+                    if !text.starts_with("refused: ") && (prop == "text" || prop == "declined") && self.owed.iter().any(|(_, r, _)| *r == eid) {
+                        if let Some(s) = &mut self.step { s.answered.push(eid.clone()); }
+                        text = "ok: written; this item is answered, do not write to it again".to_string();
+                    }
                     self.answers.insert(id, text);
                 }
                 // the write of a cliff's code: an ok says nothing (the result comes on the node), a refusal ends the call
@@ -244,10 +250,11 @@ impl Brain {
 
     /// What the seat owes: an item not in the last set seen is new and wakes a step; the set is kept so a step can be shown all of it.
     fn read_owed(&mut self, peer: &mut Peer) -> Result<(), String> {
+        if let Seen::Live(J::String(b)) = peer.seen(&owed_id(&self.ns), "banner")? { self.banner = b; }
         let Seen::Live(items) = peer.seen(&owed_id(&self.ns), "items")? else { return Ok(()) };
-        let now: Vec<(String, String)> = items.as_array().into_iter().flatten().filter_map(|i| Some((i.get("message")?.as_str()?.to_string(), i.get("response")?.as_str()?.to_string()))).collect();
-        if now.iter().any(|(m, _)| !self.owed_known.contains(m)) { self.owed_wake = true; }
-        self.owed_known = now.iter().map(|(m, _)| m.clone()).collect();
+        let now: Vec<(String, String, String)> = items.as_array().into_iter().flatten().filter_map(|i| Some((i.get("message")?.as_str()?.to_string(), i.get("response")?.as_str()?.to_string(), i.get("text").and_then(J::as_str).unwrap_or("").to_string()))).collect();
+        if now.iter().any(|(m, _, _)| !self.owed_known.contains(m)) { self.owed_wake = true; }
+        self.owed_known = now.iter().map(|(m, _, _)| m.clone()).collect();
         self.owed = now;
         Ok(())
     }
@@ -272,14 +279,15 @@ impl Brain {
                 Seen::Absent => { self.fail(peer, &format!("there is no doctrine on the seat ({DOCTRINE_ID}.text); a step waits for it")); return Ok(()); }
             };
             let mut delta = String::new();
+            if !self.banner.is_empty() { delta.push_str(&format!("<banner>\n{}\n</banner>\n\n", self.banner)); }
             if !self.backlog.is_empty() {
                 delta.push_str("Graph changes since your last step (pointers only; read a node to see its value):\n");
                 for r in self.backlog.drain(..) { delta.push_str(&r.line()); delta.push('\n'); }
             }
-            let shown: Vec<String> = self.owed.iter().map(|(m, _)| m.clone()).collect();
+            let shown: Vec<String> = self.owed.iter().map(|(m, _, _)| m.clone()).collect();
             if !self.owed.is_empty() {
                 delta.push_str("Owed (answer each with a write of text to its response node, or write declined with a reason there):\n");
-                for (m, r) in &self.owed { delta.push_str(&format!("{m} -> {r}\n")); }
+                for (m, r, t) in &self.owed { delta.push_str(&format!("{m} -> {r}: {t}\n")); }
             }
             self.owed_wake = false;
             if !self.fired.is_empty() {
@@ -431,7 +439,7 @@ impl Brain {
     fn finish(&mut self, peer: &mut Peer, said: Option<String>) -> Result<(), String> {
         // an item this step was shown that is still owed, and that the step did not answer or decline, is never dropped silently
         let open: Vec<String> = match &self.step {
-            Some(s) => self.owed.iter().filter(|(m, r)| s.owed_shown.contains(m) && !s.answered.contains(r)).map(|(m, _)| m.clone()).collect(),
+            Some(s) => self.owed.iter().filter(|(m, r, _)| s.owed_shown.contains(m) && !s.answered.contains(r)).map(|(m, _, _)| m.clone()).collect(),
             None => vec![],
         };
         if !open.is_empty() { self.fail(peer, &format!("the step ended with {} owed items still open: {}", open.len(), open.join(", "))); }

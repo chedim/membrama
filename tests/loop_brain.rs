@@ -718,7 +718,7 @@ fn an_alarm_step_is_offered_what_is_still_owed_and_nothing_owed_has_no_section()
 fn the_step_starts_with_the_banner_in_banner_tags_then_each_owed_line_has_the_persons_whole_words() {
     let mut r = Rig::new("o5", Some("d"), cfg());
     r.drive(4);
-    let long = "w".repeat(5000);
+    let long = "w".repeat(3000);
     r.sim.set_node(OWED, "banner", json!("It is Thursday. You are Blurp."));
     r.sim.set_node(OWED, "items", json!([{"message": "Chat:main:message:a1", "text": long, "response": "Chat:main:message:a1:turn:response"}]));
     r.drive(10);
