@@ -68,21 +68,7 @@ impl Sim {
                 if self.subs.contains(&id) { self.publish_node(&id); }
                 out.push(Op::Res { wid, refused: None });
             }
-            Op::Read { id, props, rid } => {
-                let body = match self.nodes.get(&id) {
-                    Some(m) => ValBody::Props(J::Object(props.iter().filter_map(|p| m.get(p).map(|v| (p.clone(), v.clone()))).collect())),
-                    None => ValBody::Gone,
-                };
-                out.push(Op::Val { id, r: 1.0, rid: Some(rid), body });
-            }
-            Op::Query { qid, by, .. } => {
-                let ids: Vec<J> = match by {
-                    graphlink_core::frame::QueryBy::Prefix(p) => { let mut v: Vec<&String> = self.nodes.keys().filter(|k| k.starts_with(&p)).collect(); v.sort(); v.into_iter().map(|k| json!({"id": k})).collect() }
-                    _ => vec![],
-                };
-                let total = ids.len() as u64;
-                out.push(Op::Page { qid, rows: ids, next: None, total: Some(total) });
-            }
+            // the real seat answers `wr` and publishes what is subscribed; it does not answer `read` or `query` ops (cliffvm peers.rs)
             _ => {}
         }
     }
@@ -222,7 +208,7 @@ fn an_outside_change_wakes_a_step_told_doctrine_and_delta_with_pointers_not_valu
     assert!(u.contains("person:1"), "the delta says who wrote it: {u}");
     assert!(!u.contains("SECRET-BODY"), "pointers only, the model reads the value itself: {u}");
     let names: Vec<&str> = tools.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["write", "read", "query", "alarm", "run_cliff"]);
+    assert_eq!(names, vec!["write", "read", "alarm", "run_cliff"]);
 }
 
 #[test]
@@ -307,16 +293,36 @@ fn the_read_tool_gets_the_value_from_the_seat_and_the_model_continues_with_it() 
 }
 
 #[test]
-fn the_query_tool_pages_through_the_seat() {
+fn read_gets_the_props_from_the_cells_the_seat_publishes_and_a_missing_node_is_told() {
     let mut r = Rig::new("l13", Some("d"), cfg());
     r.drive(4);
     r.sim.nodes.entry("Room:a".into()).or_default().insert("t".into(), json!(1));
-    r.sim.nodes.entry("Room:b".into()).or_default().insert("t".into(), json!(1));
-    r.model.script.push_back(calls(vec![("query", json!({"prefix": "Room:"}))]));
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a", "props": ["t"]})), ("read", json!({"id": "Room:none", "props": ["t"]}))]));
     r.sim.ext("Message:1", "text", "x");
     r.drive(10);
-    let told = r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().to_string();
-    assert!(told.contains("Room:a") && told.contains("Room:b"), "{told}");
+    let told: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert!(told[0].contains("\"t\":1"), "{told:?}");
+    assert!(told[1].contains("no such node"), "{told:?}");
+}
+
+#[test]
+fn there_is_no_query_tool_because_the_seat_does_not_answer_it_over_the_link() {
+    assert!(tool_specs().iter().all(|t| t["function"]["name"] != "query"));
+}
+
+#[test]
+fn a_step_that_waits_says_what_for_on_the_loops_node_and_stops_saying_it_when_it_has_the_answer() {
+    let mut r = Rig::new("l13b", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    let w = r.own(LOOP_ID, "waiting").and_then(|v| v.as_str().map(String::from)).expect("a waiting step is visible");
+    assert!(w.contains("run_cliff") && w.contains("answer"), "{w}");
+    let node = cliff_node(&r);
+    r.sim.set_node(&node, "result", json!(1));
+    r.drive(10);
+    assert_eq!(r.own(LOOP_ID, "waiting"), Some(J::Null));
 }
 
 #[test]
