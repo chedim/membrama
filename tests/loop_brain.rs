@@ -166,9 +166,9 @@ fn on_connect_the_loop_writes_the_log_viewer_and_the_guard_to_the_seat_as_packs(
 }
 
 #[test]
-fn the_viewer_is_a_tab_that_reads_the_logview_and_the_guard_removes_both_when_the_link_is_not_up() {
+fn the_viewer_is_a_tab_and_the_guard_removes_both_when_the_link_is_not_up() {
     let v = viewer_pack("membrama");
-    for want in ["PACK membrama_logview", "IMPORT dom 1", "IMPORT shell_view 1", "('Nav:membrama_log').title", "DomNode:shell:slot:membrama_log", "('Nav:membrama_log').filled = True", LOGVIEW] {
+    for want in ["PACK membrama_logview", "IMPORT dom 1", "IMPORT shell_view 1", "('Nav:membrama_log').title", "DomNode:shell:slot:membrama_log", "('Nav:membrama_log').filled = True"] {
         assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
     }
     let g = guard_pack("membrama");
@@ -177,7 +177,41 @@ fn the_viewer_is_a_tab_that_reads_the_logview_and_the_guard_removes_both_when_th
     }
     assert!(!g.contains("IMPORT dom"), "the guard runs on the seat, so it must not import the page's pack");
     // another namespace is another pack text
-    assert!(viewer_pack("brain2").contains("membrane::LogView:brain2") && guard_pack("brain2").contains("Vm:brain2"));
+    assert!(guard_pack("brain2").contains("Vm:brain2"));
+}
+
+#[test]
+fn the_tab_asks_for_its_own_view_by_the_door_and_never_reads_the_logview_by_link() {
+    let v = viewer_pack("membrama");
+    // the view is virtual and a link does not carry it: no read of it by `prop(...)`, no namespace baked in
+    assert!(!v.contains("prop('membrane::LogView"), "the tab must not read the LogView through the link:\n{v}");
+    assert!(!v.contains("@NS@") && !v.contains("membrama::"), "the tab asks in the page's own namespace:\n{v}");
+    for want in ["IMPORT fetch 1", "'::LogAsk:main'", "'membrane::LogView:'", "entity_write", "entity_read", "'rows'", "'head'", "'from'", "'n'",
+                 "Link:page", "'ns'", "Shell.tick on-setter", "Nav:membrama_log", "200", "max(0,", "Fetch:mlog:"] {
+        assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
+    }
+    // follows only while the tab is the active one
+    assert!(v.contains("prop('Nav:membrama_log', 'active') == True"), "{v}");
+    // scrollable, kept at the bottom, loads older lines in pages
+    for want in ["'panelrows'", "scroll = 'end'", "View:chat', 'stick_px'", "DomNode:mlog:older:btn", "Load older lines", "'older_out'", "max(0, prop('MLog:main', 'first') - 200)", "200 * (prop('MLog:main', 'pages') or 1)", "prop(r, 'n') < prop('MLog:main', 'first')"] {
+        assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
+    }
+    // a line is `n eid.prop op by writer`
+    assert!(v.contains("' by '"), "{v}");
+}
+
+#[test]
+fn what_is_published_as_said_has_no_leading_thinking_block_and_the_model_still_sees_it() {
+    let mut r = Rig::new("l_think", Some("d"), cfg());
+    r.drive(8);
+    r.model.script.push_back(Ok(Reply { text: "<think>first plan</think>asking".into(), tool_calls: vec![ToolCall { name: "write".into(), arguments: json!({"id": "Note:1", "prop": "text", "value": "hi"}) }] }));
+    r.model.script.push_back(Ok(Reply { text: "<think>the raw\nplan</think>\n\nall quiet".into(), tool_calls: vec![] }));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(12);
+    assert_eq!(r.own(LOOP_ID, "said"), Some(json!("all quiet")));
+    let sent = r.model.seen[1].0.iter().find(|m| m["role"] == "assistant").unwrap()["content"].as_str().unwrap().to_string();
+    assert!(sent.contains("<think>first plan</think>"), "the conversation sent back to the model is unchanged: {sent}");
+    assert!(strip_thinking("no block here") == "no block here" && strip_thinking("  <think>a</think>b") == "b" && strip_thinking("a <think>x</think> b") == "a <think>x</think> b");
 }
 
 #[test]

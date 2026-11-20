@@ -67,6 +67,11 @@ pub fn viewer_pack(ns: &str) -> String { fill(include_str!("brain/logview.c1f"),
 /// The seat-side guard: removes both packs when `Vm:<ns>.link` is not up.
 pub fn guard_pack(ns: &str) -> String { fill(include_str!("brain/logguard.c1f"), ns) }
 
+/// The words a step ends with, as published: a leading `<think>...</think>` block is the model's own reasoning and is left out. Only the published `said` is cut; the conversation is not.
+pub fn strip_thinking(text: &str) -> String {
+    match text.trim_start().strip_prefix("<think>").and_then(|r| r.split_once("</think>")) { Some((_, rest)) => rest.trim().to_string(), None => text.to_string() }
+}
+
 /// The tools of a step, as the model is shown them.
 pub fn tool_specs() -> Vec<J> {
     let f = |name: &str, description: &str, parameters: J| json!({"type": "function", "function": {"name": name, "description": description, "parameters": parameters}});
@@ -483,7 +488,7 @@ impl Brain {
         self.show_waiting(peer)?;
         self.steps += 1;
         peer.publish(LOOP_ID, "steps", &json!(self.steps))?;
-        if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(live_tail(&t, peer.val_cap() as usize)))?; }   // longer than the cell: its tail, as `live` does; a write that cannot fit must not end the loop
+        if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(live_tail(&strip_thinking(&t), peer.val_cap() as usize)))?; }   // without its thinking block; longer than the cell: its tail, as `live` does; a write that cannot fit must not end the loop
         if !failed && self.error.is_some() { self.error = None; peer.publish(LOOP_ID, "error", &J::Null)?; }
         Ok(())
     }
