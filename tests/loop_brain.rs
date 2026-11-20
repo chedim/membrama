@@ -638,3 +638,80 @@ fn a_trail_that_does_not_fit_the_peers_cell_drops_the_oldest_entries_and_says_ho
     assert!(serde_json::to_string(&t).unwrap().len() <= r.peer.val_cap() as usize);
     assert!(t.last().unwrap()["text"] == "ok" && t.iter().any(|e| e["tool"] == "write"), "the newest entries are kept");
 }
+
+// ---- what the seat owes: `membrane::Owed:<ns>.items`
+
+const OWED: &str = "membrane::Owed:membrama";
+fn item(m: &str) -> J { json!({"message": format!("Chat:main:message:{m}"), "response": format!("Chat:main:message:{m}:turn:response")}) }
+fn owed(r: &mut Rig, ms: &[&str]) { let v: Vec<J> = ms.iter().map(|m| item(m)).collect(); r.sim.set_node(OWED, "items", json!(v)); }
+const HEAD: &str = "Owed (answer each with a write of text to its response node, or write declined with a reason there):";
+
+#[test]
+fn the_loop_subscribes_to_what_the_seat_owes() {
+    let mut r = Rig::new("o0", Some("d"), cfg());
+    r.drive(4);
+    assert!(r.sim.subs.iter().any(|s| s == OWED), "{:?}", r.sim.subs);
+}
+
+#[test]
+fn a_new_owed_item_wakes_a_step_told_in_a_section_of_pointers_and_one_left_open_is_an_error() {
+    let mut r = Rig::new("o1", Some("d"), cfg());
+    r.drive(4);
+    owed(&mut r, &["a1"]);
+    r.drive(10);
+    assert_eq!(r.model.seen.len(), 1, "an owed item wakes a step with no log line behind it");
+    let u = user(&r.model.seen[0]);
+    assert!(u.contains(HEAD), "{u}");
+    assert!(u.contains("Chat:main:message:a1 ") && u.contains("Chat:main:message:a1:turn:response"), "{u}");
+    let e = r.error().expect("an item left open is shown");
+    assert!(e.contains("1 owed items still open") && e.contains("Chat:main:message:a1"), "{e}");
+}
+
+#[test]
+fn an_item_still_owed_is_offered_again_but_only_a_new_item_or_an_alarm_wakes_a_step() {
+    let mut r = Rig::new("o2", Some("d"), cfg());
+    r.drive(4);
+    owed(&mut r, &["a1"]);
+    r.drive(10);
+    r.drive(30);
+    assert_eq!(r.model.seen.len(), 1, "no retry loop of its own");
+    owed(&mut r, &["a1", "b2"]);
+    r.drive(10);
+    assert_eq!(r.model.seen.len(), 2);
+    let u = user(&r.model.seen[1]);
+    assert!(u.contains("message:a1 ") && u.contains("message:b2 "), "the old item is offered again: {u}");
+    assert!(r.error().unwrap().contains("2 owed items still open"));
+}
+
+#[test]
+fn a_write_of_text_or_declined_on_the_response_resolves_it_and_no_error_is_left() {
+    let mut r = Rig::new("o3", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![
+        ("write", json!({"id": "Chat:main:message:a1:turn:response", "prop": "text", "value": "hi"})),
+        ("write", json!({"id": "Chat:main:message:b2:turn:response", "prop": "declined", "value": "not for me"})),
+    ]));
+    owed(&mut r, &["a1", "b2"]);
+    r.drive(12);
+    assert_eq!(r.model.seen.len(), 2);
+    assert_eq!(r.error(), None, "both were resolved by this step, although the seat has not yet taken them off the list");
+    owed(&mut r, &[]);
+    r.drive(10);
+    assert_eq!(r.model.seen.len(), 2, "an empty list wakes nothing");
+}
+
+#[test]
+fn an_alarm_step_is_offered_what_is_still_owed_and_nothing_owed_has_no_section() {
+    let mut r = Rig::new("o4", Some("d"), cfg());
+    r.drive(4);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    assert!(!user(&r.model.seen[0]).contains(HEAD));
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 0.05, "note": "retry"}))]));
+    owed(&mut r, &["a1"]);
+    r.drive(8);
+    let n = r.model.seen.len();
+    r.drive(20);
+    assert!(r.model.seen.len() > n, "the alarm woke a step");
+    assert!(user(r.model.seen.last().unwrap()).contains("message:a1 "));
+}
