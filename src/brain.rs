@@ -199,7 +199,11 @@ impl Brain {
                 Seen::Live(rows) => {
                     let cursor = self.cursor.unwrap_or(0);
                     for r in rows.as_array().into_iter().flatten() {
-                        if self.backlog.len() >= self.cfg.delta_cap { break; }
+                        if self.backlog.len() >= self.cfg.delta_cap {
+                            // a full backlog is drained by a step, and only an outside line wakes one: held lines that are all its own are context, so the oldest makes room
+                            if self.backlog.iter().any(|b| !b.own) { break; }
+                            self.backlog.remove(0);
+                        }
                         let Some(n) = r.get("n").and_then(J::as_u64) else { continue };
                         if n < cursor { continue; }
                         let text = |k: &str| r.get(k).and_then(J::as_str).unwrap_or("").to_string();
