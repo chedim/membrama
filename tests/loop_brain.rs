@@ -469,3 +469,87 @@ mod template_model {
         assert_eq!(reply.text, "nothing to do");
     }
 }
+
+// ---- run_cliff: the seat-side runner is babyseat's (a node `membrane::Cliff:<ns>:<id>`: the peer writes `code`, the runner answers `result` or `error`, and retires the node when the peer retires it)
+
+fn cliff_node(r: &Rig) -> String { r.sim.writes.iter().find(|w| w.1 == "code").map(|w| w.0.clone()).expect("no code was written") }
+
+#[test]
+fn run_cliff_is_one_of_the_tools_and_takes_code() {
+    let t = tool_specs();
+    let f = t.iter().find(|x| x["function"]["name"] == "run_cliff").expect("run_cliff is a tool");
+    assert!(f["function"]["parameters"]["required"].as_array().unwrap().iter().any(|v| v == "code"));
+}
+
+#[test]
+fn run_cliff_writes_the_code_to_a_cliff_node_and_the_result_is_the_tool_result() {
+    let mut r = Rig::new("l20", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1 + 1"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    let node = cliff_node(&r);
+    assert!(node.starts_with("membrane::Cliff:membrama:"), "{node}");
+    assert_eq!(r.sim.written(&node, "code"), vec![json!("1 + 1")]);
+    assert_eq!(r.model.seen.len(), 1, "the step waits for the runner, across turns, with no timeout");
+    r.drive(20);
+    assert_eq!(r.model.seen.len(), 1);
+    r.sim.set_node(&node, "result", json!(2));
+    r.drive(10);
+    assert_eq!(r.model.seen.len(), 2);
+    let told = r.model.seen[1].0.last().unwrap();
+    assert_eq!(told["role"], "tool");
+    assert_eq!(told["content"], "2");
+    assert!(r.sim.written(&node, "retire").contains(&json!(true)), "the peer retires the node when it has the result");
+}
+
+#[test]
+fn run_cliff_tells_the_runners_error_text() {
+    let mut r = Rig::new("l21", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "boom("}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    let node = cliff_node(&r);
+    r.sim.set_node(&node, "error", json!("syntax error at 1"));
+    r.drive(10);
+    let told = r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().to_string();
+    assert!(told.starts_with("error:") && told.contains("syntax error at 1"), "{told}");
+    assert!(r.sim.written(&node, "retire").contains(&json!(true)));
+}
+
+#[test]
+fn run_cliff_refused_write_and_missing_code_are_told_not_waited_for() {
+    let mut r = Rig::new("l22", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    assert!(r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().contains("code"));
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"}))]));
+    r.sim.refuse = Some("no run rights".into());
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(10);
+    let told = r.model.seen.last().unwrap().0.last().unwrap()["content"].as_str().unwrap().to_string();
+    assert!(told.contains("refused") && told.contains("no run rights"), "{told}");
+}
+
+#[test]
+fn two_cliff_calls_in_one_round_and_in_two_steps_use_different_nodes() {
+    let mut r = Rig::new("l23", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"})), ("run_cliff", json!({"code": "2"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    let nodes: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.0.clone()).collect();
+    assert_eq!(nodes.len(), 2);
+    assert_ne!(nodes[0], nodes[1]);
+    for (n, v) in nodes.iter().zip([1, 2]) { r.sim.set_node(n, "result", json!(v)); }
+    r.drive(10);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "3"}))]));
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(8);
+    let all: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.0.clone()).collect();
+    assert_eq!(all.len(), 3);
+    assert!(!nodes.contains(&all[2]), "a later step's call must not reuse a node whose result is already there");
+}
