@@ -17,7 +17,7 @@ fn a_full_command_line_is_the_config() {
     assert_eq!(parse(&full()), Ok(Config {
         peer: "membrama".into(), ns: "membrama".into(), model: "/m/qwen3.gguf".into(), n_ctx: 2048,
         numbers: Numbers { slots: 256, key_cap: 128, val_cap: 4096, epoch: 1, spins: 1_000_000, depth: 32 },
-        bank_cap: 2_000_000_000, max_banks: 1, die_with_parent: true, token_file: None,
+        bank_cap: 2_000_000_000, max_banks: 1, die_with_parent: true, token_file: None, brain: None,
     }));
 }
 

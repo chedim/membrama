@@ -1,5 +1,6 @@
 //! The command line of `membrama serve`, the program the seat starts from its `peers` fact. Every number is the owner's and has no default
 //! (the regions' sizes must equal what the seat declared; the model's context and the bank limits are the owner's choices).
+use crate::brain::{BrainConfig, Start};
 use crate::peer::Numbers;
 use std::collections::HashMap;
 
@@ -21,20 +22,26 @@ pub struct Config {
     pub die_with_parent: bool,
     /// The file holding the token the seat made for this peer (`<data dir>/peers/<name>.token`): the seat refuses a hello without one.
     pub token_file: Option<String>,
+    /// The loop's numbers, when `--loop` is given.
+    pub brain: Option<BrainConfig>,
 }
 
 /// Banks are on unless the limit says otherwise: the owner's choice (2026-11-18), and the measured limit (a bank is safe only alone in a prompt).
 pub const DEFAULT_MAX_BANKS: usize = 1;
 
-const VALUED: [&str; 13] = ["--token-file", "--peer", "--ns", "--model", "--n-ctx", "--slots", "--key-cap", "--val-cap", "--epoch", "--spins", "--depth", "--bank-cap", "--max-banks"];
+const LOOP_OPTS: [&str; 5] = ["--loop-delta-cap", "--loop-max-new", "--loop-max-rounds", "--loop-ask-ms", "--loop-start"];
+
+const VALUED: [&str; 18] = ["--token-file", "--peer", "--ns", "--model", "--n-ctx", "--slots", "--key-cap", "--val-cap", "--epoch", "--spins", "--depth", "--bank-cap", "--max-banks", "--loop-delta-cap", "--loop-max-new", "--loop-max-rounds", "--loop-ask-ms", "--loop-start"];
 
 pub fn parse(args: &[String]) -> Result<Config, String> {
     let mut got: HashMap<&str, &str> = HashMap::new();
     let mut die_with_parent = false;
+    let mut looping = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--die-with-parent" { die_with_parent = true; i += 1; continue; }
+        if a == "--loop" { looping = true; i += 1; continue; }
         let Some(opt) = VALUED.iter().find(|o| **o == a) else { return Err(format!("unknown option {a}")) };
         let Some(v) = args.get(i + 1) else { return Err(format!("{opt} needs a value")) };
         got.insert(opt, v);
@@ -45,10 +52,16 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         let v = got.get(o).ok_or_else(|| format!("missing {o} (no default: it is the owner's number)"))?;
         v.parse::<T>().map_err(|_| format!("{o}: {v:?} is not a number"))
     }
+    let brain = if looping {
+        let start = match text("--loop-start")?.as_str() { "head" => Start::Head, "beginning" => Start::Beginning, other => return Err(format!("--loop-start: {other:?} is not head or beginning")) };
+        Some(BrainConfig { delta_cap: num(&got, "--loop-delta-cap")?, max_new: num(&got, "--loop-max-new")?, max_rounds: num(&got, "--loop-max-rounds")?, ask_every_ms: num(&got, "--loop-ask-ms")?, start })
+    } else if let Some(o) = LOOP_OPTS.iter().find(|o| got.contains_key(**o)) {
+        return Err(format!("{o} is a number of the loop, which --loop turns on"));
+    } else { None };
     Ok(Config {
         peer: text("--peer")?, ns: text("--ns")?, model: text("--model")?, n_ctx: num(&got, "--n-ctx")?,
         numbers: Numbers { slots: num(&got, "--slots")?, key_cap: num(&got, "--key-cap")?, val_cap: num(&got, "--val-cap")?, epoch: num(&got, "--epoch")?, spins: num(&got, "--spins")?, depth: num(&got, "--depth")? },
         bank_cap: num(&got, "--bank-cap")?, max_banks: if got.contains_key("--max-banks") { num(&got, "--max-banks")? } else { DEFAULT_MAX_BANKS }, die_with_parent,
-        token_file: got.get("--token-file").map(|v| v.to_string()),
+        token_file: got.get("--token-file").map(|v| v.to_string()), brain,
     })
 }

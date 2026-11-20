@@ -3,6 +3,7 @@
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
+use membrama::brain::{Brain, TemplateModel};
 use membrama::cli::{parse, Config};
 use membrama::engine::{EngineGenerator, Runner};
 use membrama::peer::Peer;
@@ -27,9 +28,15 @@ fn serve(cfg: Config) {
     let runner = Runner::new(&model, &backend, cfg.n_ctx).unwrap_or_else(|e| fail(&e));
     let mut generator = EngineGenerator::new(runner, &cfg.model, cfg.bank_cap, cfg.max_banks);
     let mut handler = Handler::new();
+    let mut brain = cfg.brain.clone().map(|b| Brain::new(b, &cfg.ns));
+    let started = std::time::Instant::now();
     eprintln!("membrama: serving {} as {} (model {})", cfg.peer, cfg.ns, cfg.model);
     loop {
-        if let Err(e) = handler.tick(&mut peer, &mut generator) { fail(&e); }
+        let events = match handler.tick(&mut peer, &mut generator) { Ok(e) => e, Err(e) => fail(&e) };
+        if let (Some(brain), Some(b)) = (brain.as_mut(), cfg.brain.as_ref()) {
+            let mut model = TemplateModel { generator: &mut generator, max_new: b.max_new };
+            if let Err(e) = brain.tick(&mut peer, &mut model, &events, started.elapsed().as_millis() as u64) { fail(&e); }
+        }
         if peer.is_closed() { exit(0); }
         if parent != 0 && std::os::unix::process::parent_id() != parent { exit(0); }
         std::thread::sleep(Duration::from_millis(5));   // the same nap as graphlink-bridge; the seat itself notices a change within 50 ms
@@ -40,6 +47,6 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("serve") => serve(parse(&args[1..]).unwrap_or_else(|e| fail(&e))),
-        _ => fail("usage: membrama serve --peer <name> --ns <namespace> --model <gguf> --n-ctx <n> --slots <n> --key-cap <n> --val-cap <n> --epoch <n> --spins <n> --depth <n> --bank-cap <bytes> [--max-banks <n>] [--token-file <path>] [--die-with-parent]"),
+        _ => fail("usage: membrama serve --peer <name> --ns <namespace> --model <gguf> --n-ctx <n> --slots <n> --key-cap <n> --val-cap <n> --epoch <n> --spins <n> --depth <n> --bank-cap <bytes> [--max-banks <n>] [--token-file <path>] [--die-with-parent] [--loop --loop-delta-cap <n> --loop-max-new <n> --loop-max-rounds <n> --loop-ask-ms <n> --loop-start head|beginning]"),
     }
 }
