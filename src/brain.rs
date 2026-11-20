@@ -363,7 +363,17 @@ impl Brain {
         let Some(step) = &mut self.step else { return Ok(()) };
         step.round += 1;
         let round = step.round;
-        let reply = match model.step(&step.messages, &self.tools) {
+        // the round so far goes to `live` with every piece the model writes (as the chat turn handler publishes each chunk, src/turn.rs), the tail kept when it would not fit the peer's cell
+        let cap = peer.val_cap() as usize;
+        let mut live = String::new();
+        let mut live_err: Option<String> = None;
+        let result = model.step_live(&step.messages, &self.tools, &mut |piece: &str| {
+            live.push_str(piece);
+            if live_err.is_none() { if let Err(e) = peer.publish(LOOP_ID, "live", &json!(live_tail(&live, cap))) { live_err = Some(e); } }
+        });
+        if !live.is_empty() || live_err.is_some() { peer.publish(LOOP_ID, "live", &json!(""))?; }
+        if let Some(e) = live_err { self.fail(peer, &format!("the live view of the round could not be written: {e}")); }
+        let reply = match result {
             Ok(r) => r,
             Err(e) => { self.fail(peer, &format!("the model call failed: {e}")); return self.finish(peer, None); }
         };
@@ -541,18 +551,33 @@ impl Brain {
     }
 }
 
+/// What shows of the round's text so far in a cell of `cap` bytes (its JSON text, a bound on the cell's size): all of it, or its tail after a marker line.
+fn live_tail(text: &str, cap: usize) -> String {
+    let fits = |t: &str| serde_json::to_string(t).map_or(false, |j| j.len() <= cap);
+    if fits(text) { return text.to_string(); }
+    const MARK: &str = "[\u{2026}earlier text dropped]\n";
+    let mut start = text.len().saturating_sub(cap.saturating_sub(MARK.len() + 2));
+    loop {
+        while start < text.len() && !text.is_char_boundary(start) { start += 1; }
+        let shown = format!("{MARK}{}", &text[start..]);
+        if fits(&shown) || start >= text.len() { return shown; }
+        start += (serde_json::to_string(&shown).map_or(0, |j| j.len()) - cap).max(1);
+    }
+}
+
 /// The real model of the loop: a `Generator` with the model's own chat template. The step is rendered with it, run with the owner's `max_new`, and the tool calls are read out of the reply.
 pub struct TemplateModel<'a> { pub generator: &'a mut dyn Generator, pub max_new: usize }
 
 impl Model for TemplateModel<'_> {
-    fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String> {
+    fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String> { self.step_live(messages, tools, &mut |_| {}) }
+    fn step_live(&mut self, messages: &[J], tools: &[J], on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
         let template = self.generator.chat_template().ok_or("the model has no chat template, so a step cannot be rendered")?;
         let format = detect_format(&template);
         if !tools.is_empty() && format.is_none() { return Err("tools are not supported for this model: the format its replies use for tool calls is not known".into()); }
         let text = render(&template, messages, tools, &Options { add_generation_prompt: true, enable_thinking: None })?;
         let job = Job { id: "loop".into(), server: String::new(), parts: vec![Part { kind: PartKind::Text, text }], max_new: self.max_new, chat: Some(format) };
         let mut said = String::new();
-        self.generator.generate(&job, &mut |piece: &str| { said.push_str(piece); true })?;
+        self.generator.generate(&job, &mut |piece: &str| { said.push_str(piece); on_text(piece); true })?;
         match format {
             Some(f) => { let p = parse(&said, f)?; Ok(Reply { text: p.content, tool_calls: p.tool_calls }) }
             None => Ok(Reply { text: said.trim().to_string(), tool_calls: vec![] }),

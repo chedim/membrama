@@ -858,7 +858,7 @@ fn the_text_of_the_round_so_far_is_published_as_it_grows_and_cleared_when_the_ro
 #[test]
 fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker() {
     let cap = membrama::peer::Numbers { slots: 0, key_cap: 0, val_cap: 4096, epoch: 0, spins: 0, depth: 0 }.val_cap as usize;
-    let piece = "abcdefghij".repeat(100);
+    let piece = "abcdefghij".repeat(150);
     let (mut sim, mut peer, mut brain, mut model) = live_rig("v2", vec![piece.clone(), piece.clone(), piece.clone(), piece.clone(), "THE-END".into()]);
     sim.ext("Message:1", "text", "x");
     for i in 0..6 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 2_000 + i * 10).unwrap(); }
