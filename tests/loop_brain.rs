@@ -4,7 +4,7 @@
 //! seat's real LogView or write gate (cliffvm), or about the packs running in a real engine.
 mod common;
 use common::{cell, FakeSeat};
-use graphlink_core::frame::{Op, Target, ValBody};
+use graphlink_core::frame::{Op, Target};
 use graphlink_core::link::Event;
 use graphlink_core::transport::Transport;
 use graphlink_shm::cells::CellsReader;
@@ -22,7 +22,12 @@ struct Sim {
     journal: Vec<J>,
     writes: Vec<(String, String, J)>,
     subs: Vec<String>,
+    prefix_subs: Vec<String>,
     refuse: Option<String>,
+    /// refuse only the writes to nodes whose id holds this text
+    refuse_for: Option<String>,
+    /// the seat's Cliff runner answers a read-shaped clifflet with this error instead of its value
+    cliff_error: Option<String>,
     reader: Option<CellsReader>,
     served_n: f64,
     /// the LogView's page does not fit the peer's table: the cell is Refused, as the seat's driver writes it
@@ -33,7 +38,7 @@ impl Sim {
     fn new(tag: &str, doctrine: Option<&str>) -> (Sim, Peer) {
         let seat = FakeSeat::start(tag);
         let mut peer = seat.peer();
-        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], refuse: None, reader: None, served_n: -1.0, rows_too_big: false };
+        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], prefix_subs: vec![], refuse: None, refuse_for: None, cliff_error: None, reader: None, served_n: -1.0, rows_too_big: false };
         if let Some(d) = doctrine { sim.nodes.entry(DOCTRINE_ID.into()).or_default().insert("text".into(), json!(d)); }
         sim.pump(&mut peer);
         (sim, peer)
@@ -49,7 +54,7 @@ impl Sim {
     }
     fn set_node(&mut self, eid: &str, prop: &str, v: J) {
         self.nodes.entry(eid.into()).or_default().insert(prop.into(), v);
-        if self.subs.iter().any(|s| s == eid) { self.publish_node(eid); }
+        if self.subs.iter().any(|s| s == eid) || self.prefix_subs.iter().any(|p| eid.starts_with(p.as_str())) { self.publish_node(eid); }
     }
     fn publish_node(&mut self, eid: &str) {
         let props: Vec<(String, J)> = self.nodes.get(eid).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
@@ -57,32 +62,37 @@ impl Sim {
         self.seat.put(eid, "", json!(true));
         for (k, v) in props { self.seat.put(eid, &k, v); }
     }
+    /// The seat's runner for the one clifflet shape the read tool writes, `{'p': prop('N', 'p'), ...}`: a dict of the props, null for what is not there; other code is left to the test.
+    fn run_read_clifflet(&mut self, node: &str, code: &str) {
+        if !code.starts_with("{'") { return; }
+        if let Some(e) = self.cliff_error.clone() { self.set_node(node, "error", json!(e)); return; }
+        let mut m = serde_json::Map::new();
+        for part in code.split("prop('").skip(1) {
+            let (n, rest) = part.split_once("', '").unwrap();
+            let p = rest.split_once("')").unwrap().0;
+            m.insert(p.to_string(), self.nodes.get(n).and_then(|x| x.get(p)).cloned().unwrap_or(J::Null));
+        }
+        self.set_node(node, "result", J::Object(m));
+    }
     fn on_op(&mut self, op: Op, out: &mut Vec<Op>) {
         match op {
             Op::Sub { target: Target::Id(id), .. } => { self.subs.push(id.clone()); self.publish_node(&id); }
+            Op::Sub { target: Target::Prefix(p), .. } => {
+                self.prefix_subs.push(p.clone());
+                let ids: Vec<String> = self.nodes.keys().filter(|k| k.starts_with(&p)).cloned().collect();
+                for id in ids { self.publish_node(&id); }
+            }
             Op::Wr { wid, id, prop, value } => {
+                if let (Some(m), true) = (self.refuse_for.clone(), true) { if id.contains(&m) { out.push(Op::Res { wid, refused: Some("no tool rows for you".into()) }); return; } }
                 if let Some(why) = self.refuse.clone() { out.push(Op::Res { wid, refused: Some(why) }); return; }
                 self.writes.push((id.clone(), prop.clone(), value.clone()));
                 self.nodes.entry(id.clone()).or_default().insert(prop.clone(), value.clone());
                 self.log(&id, &prop, "link:membrama", value.to_string().len());
                 if self.subs.contains(&id) { self.publish_node(&id); }
+                if id.starts_with("membrane::Cliff:") && prop == "code" { self.run_read_clifflet(&id, value.as_str().unwrap_or("")); }
                 out.push(Op::Res { wid, refused: None });
             }
-            Op::Read { id, props, rid } => {
-                let body = match self.nodes.get(&id) {
-                    Some(m) => ValBody::Props(J::Object(props.iter().filter_map(|p| m.get(p).map(|v| (p.clone(), v.clone()))).collect())),
-                    None => ValBody::Gone,
-                };
-                out.push(Op::Val { id, r: 1.0, rid: Some(rid), body });
-            }
-            Op::Query { qid, by, .. } => {
-                let ids: Vec<J> = match by {
-                    graphlink_core::frame::QueryBy::Prefix(p) => { let mut v: Vec<&String> = self.nodes.keys().filter(|k| k.starts_with(&p)).collect(); v.sort(); v.into_iter().map(|k| json!({"id": k})).collect() }
-                    _ => vec![],
-                };
-                let total = ids.len() as u64;
-                out.push(Op::Page { qid, rows: ids, next: None, total: Some(total) });
-            }
+            // the real seat answers `wr` and publishes what is subscribed; it does not answer `read` or `query` ops (cliffvm peers.rs)
             _ => {}
         }
     }
@@ -222,10 +232,8 @@ fn a_seat_with_no_doctrine_gets_the_first_draft_and_one_with_a_doctrine_keeps_th
 }
 
 #[test]
-fn the_draft_doctrine_is_domain_neutral() {
-    let d = DOCTRINE_DRAFT.to_lowercase();
-    assert!(d.contains("graph change"), "{DOCTRINE_DRAFT}");
-    for word in ["babyseat", "membrane", "membrama", "code", "repository", "slot", "ring", "graphlink"] { assert!(!d.contains(word), "the doctrine must not mention {word:?}"); }
+fn the_draft_doctrine_is_the_operators_own_words() {
+    assert_eq!(DOCTRINE_DRAFT.trim_end(), "Your state is stored in a dynamic programmable entity graph of a cliffhanger virtual machine. The machine is Turing-complete so the graph can sense the environment outside of itself and auto-update itself with sensed information. Use your tools to read, manipulate and program the graph state. Information about cliffhanger and VM internals can be found in \"Help\" entities. Every turn, vm sends the log of externally changed entities for you to either react yourself or use cliffhanger to program a behaviour onto the graph. Process the changes, if any, using the provided tools.");
 }
 
 #[test]
@@ -256,7 +264,7 @@ fn an_outside_change_wakes_a_step_told_doctrine_and_delta_with_pointers_not_valu
     assert!(u.contains("person:1"), "the delta says who wrote it: {u}");
     assert!(!u.contains("SECRET-BODY"), "pointers only, the model reads the value itself: {u}");
     let names: Vec<&str> = tools.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["write", "read", "query", "alarm"]);
+    assert_eq!(names, vec!["write", "read", "alarm", "run_cliff"]);
 }
 
 #[test]
@@ -341,16 +349,63 @@ fn the_read_tool_gets_the_value_from_the_seat_and_the_model_continues_with_it() 
 }
 
 #[test]
-fn the_query_tool_pages_through_the_seat() {
+fn read_is_a_clifflet_on_the_seats_runner_and_a_missing_prop_or_node_is_null() {
     let mut r = Rig::new("l13", Some("d"), cfg());
     r.drive(4);
     r.sim.nodes.entry("Room:a".into()).or_default().insert("t".into(), json!(1));
-    r.sim.nodes.entry("Room:b".into()).or_default().insert("t".into(), json!(1));
-    r.model.script.push_back(calls(vec![("query", json!({"prefix": "Room:"}))]));
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a", "props": ["t", "u"]})), ("read", json!({"id": "Room:none", "props": ["t"]}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(14);
+    let codes: Vec<J> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.2.clone()).collect();
+    assert_eq!(codes[0], json!("{'t': prop('Room:a', 't'), 'u': prop('Room:a', 'u')}"));
+    let told: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert_eq!(told[0], r#"{"t":1,"u":null}"#, "{told:?}");
+    assert_eq!(told[1], r#"{"t":null}"#, "a missing node is null per prop, not claimed to be gone: {told:?}");
+}
+
+#[test]
+fn read_refuses_an_id_or_prop_it_cannot_write_into_a_clifflet_and_says_why() {
+    let mut r = Rig::new("l13c", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a'b", "props": ["t"]})), ("read", json!({"id": "Room:a", "props": ["t\\x"]})), ("read", json!({"id": "Room:a", "props": ["line\nbreak"]}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(10);
+    assert!(r.sim.writes.iter().all(|w| w.1 != "code"), "nothing was sent to the seat");
+    let told: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert_eq!(told.len(), 3);
+    for t in &told { assert!(t.starts_with("error:") && t.contains("quote") , "{t}"); }
+}
+
+#[test]
+fn the_runners_error_for_a_read_is_the_tool_result() {
+    let mut r = Rig::new("l13d", Some("d"), cfg());
+    r.drive(4);
+    r.sim.cliff_error = Some("refused: node not readable by this peer".into());
+    r.model.script.push_back(calls(vec![("read", json!({"id": "Room:a", "props": ["t"]}))]));
     r.sim.ext("Message:1", "text", "x");
     r.drive(10);
     let told = r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().to_string();
-    assert!(told.contains("Room:a") && told.contains("Room:b"), "{told}");
+    assert!(told.starts_with("error:") && told.contains("not readable"), "{told}");
+}
+
+#[test]
+fn there_is_no_query_tool_because_the_seat_does_not_answer_it_over_the_link() {
+    assert!(tool_specs().iter().all(|t| t["function"]["name"] != "query"));
+}
+
+#[test]
+fn a_step_that_waits_says_what_for_on_the_loops_node_and_stops_saying_it_when_it_has_the_answer() {
+    let mut r = Rig::new("l13b", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    let w = r.own(LOOP_ID, "waiting").and_then(|v| v.as_str().map(String::from)).expect("a waiting step is visible");
+    assert!(w.contains("run_cliff") && w.contains("answer"), "{w}");
+    let node = cliff_node(&r);
+    r.sim.set_node(&node, "result", json!(1));
+    r.drive(10);
+    assert_eq!(r.own(LOOP_ID, "waiting"), Some(J::Null));
 }
 
 #[test]
@@ -383,6 +438,20 @@ fn the_delta_cap_bounds_one_step_and_the_rest_is_the_next_step() {
     r.drive(20);
     let counts: Vec<usize> = r.model.seen.iter().map(|m| user(m).matches("Message:").count()).collect();
     assert_eq!(counts, vec![2, 2, 1], "no line is lost and none is read twice");
+}
+
+#[test]
+fn a_full_backlog_of_its_own_lines_does_not_stop_the_reading() {
+    // seen live: the loop's own writes when it connects filled the delta cap; none of them wakes a step, so nothing drained them and the cursor never moved on
+    let mut r = Rig::new("l15b", Some("d"), BrainConfig { delta_cap: 3, start: Start::Beginning, ..cfg() });
+    for i in 0..6 { r.sim.log(&format!("Pack:p{i}"), "text", "link:membrama", 5); }
+    r.drive(8);
+    r.sim.ext("Message:late", "text", "x");
+    r.drive(20);
+    assert_eq!(r.model.seen.len(), 1, "the outside line woke a step although its own lines filled the cap before it");
+    let u = user(&r.model.seen[0]);
+    assert!(u.contains("Message:late"), "{u}");
+    assert!(r.own(LOOP_ID, "cursor").unwrap().as_u64().unwrap() >= 7, "{:?}", r.own(LOOP_ID, "cursor"));
 }
 
 #[test]
@@ -489,3 +558,359 @@ mod template_model {
         assert_eq!(reply.text, "nothing to do");
     }
 }
+
+// ---- run_cliff: the seat-side runner is babyseat's (a node `membrane::Cliff:<ns>:<id>`: the peer writes `code`, the runner answers `result` or `error`, and retires the node when the peer retires it)
+
+fn cliff_node(r: &Rig) -> String { r.sim.writes.iter().find(|w| w.1 == "code").map(|w| w.0.clone()).expect("no code was written") }
+
+#[test]
+fn run_cliff_is_one_of_the_tools_and_takes_code() {
+    let t = tool_specs();
+    let f = t.iter().find(|x| x["function"]["name"] == "run_cliff").expect("run_cliff is a tool");
+    assert!(f["function"]["parameters"]["required"].as_array().unwrap().iter().any(|v| v == "code"));
+}
+
+#[test]
+fn run_cliff_writes_the_code_to_a_cliff_node_and_the_result_is_the_tool_result() {
+    let mut r = Rig::new("c1", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1 + 1"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    let node = cliff_node(&r);
+    assert!(node.starts_with("membrane::Cliff:membrama:"), "{node}");
+    assert_eq!(r.sim.written(&node, "code"), vec![json!("1 + 1")]);
+    assert_eq!(r.model.seen.len(), 1, "the step waits for the runner, across turns, with no timeout");
+    r.drive(20);
+    assert_eq!(r.model.seen.len(), 1);
+    r.sim.set_node(&node, "result", json!(2));
+    r.drive(10);
+    assert_eq!(r.model.seen.len(), 2);
+    let told = r.model.seen[1].0.last().unwrap();
+    assert_eq!(told["role"], "tool");
+    assert_eq!(told["content"], "2");
+    assert!(r.sim.written(&node, "retire").contains(&json!(true)), "the peer retires the node when it has the result");
+}
+
+#[test]
+fn run_cliff_tells_the_runners_error_text() {
+    let mut r = Rig::new("c2", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "boom("}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    let node = cliff_node(&r);
+    r.sim.set_node(&node, "error", json!("syntax error at 1"));
+    r.drive(10);
+    let told = r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().to_string();
+    assert!(told.starts_with("error:") && told.contains("syntax error at 1"), "{told}");
+    assert!(r.sim.written(&node, "retire").contains(&json!(true)));
+}
+
+#[test]
+fn run_cliff_refused_write_and_missing_code_are_told_not_waited_for() {
+    let mut r = Rig::new("c3", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    assert!(r.model.seen[1].0.last().unwrap()["content"].as_str().unwrap().contains("code"));
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"}))]));
+    r.sim.refuse = Some("no run rights".into());
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(10);
+    let told = r.model.seen.last().unwrap().0.last().unwrap()["content"].as_str().unwrap().to_string();
+    assert!(told.contains("refused") && told.contains("no run rights"), "{told}");
+}
+
+#[test]
+fn two_cliff_calls_in_one_round_and_in_two_steps_use_different_nodes() {
+    let mut r = Rig::new("c4", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"})), ("run_cliff", json!({"code": "2"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    let nodes: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.0.clone()).collect();
+    assert_eq!(nodes.len(), 2);
+    assert_ne!(nodes[0], nodes[1]);
+    for (n, v) in nodes.iter().zip([1, 2]) { r.sim.set_node(n, "result", json!(v)); }
+    r.drive(10);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "3"}))]));
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(8);
+    let all: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.0.clone()).collect();
+    assert_eq!(all.len(), 3);
+    assert!(!nodes.contains(&all[2]), "a later step's call must not reuse a node whose result is already there");
+}
+
+#[test]
+fn every_call_id_is_letters_and_digits_only_and_unique_across_steps_rounds_calls_and_a_restart() {
+    // the seat's runner refuses an id with `:` `-` `_` or `.` (it becomes part of pack names), and never answers it
+    let ok = |id: &str| !id.is_empty() && id.replace([':', '-', '_', '.'], "") == id && id.chars().all(|c| c.is_ascii_alphanumeric());
+    let mut ids: Vec<String> = vec![];
+    for (tag, run) in [("c5", 0), ("c6", 1)] {
+        let mut r = Rig::new(tag, Some("d"), cfg());
+        if run == 1 { std::thread::sleep(std::time::Duration::from_millis(5)); r.brain = Brain::new(cfg(), "membrama"); }
+        r.drive(4);
+        for k in 0..2 {
+            r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1"})), ("run_cliff", json!({"code": "2"}))]));
+            r.sim.ext(&format!("Message:{k}"), "text", "x");
+            r.drive(6);
+            let nodes: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "code").map(|w| w.0.clone()).collect();
+            for n in &nodes { r.sim.set_node(n, "result", json!(1)); }
+            r.drive(10);
+        }
+        for (_, m) in r.model.seen.iter().enumerate() { for msg in &m.0 { for c in msg["tool_calls"].as_array().into_iter().flatten() { ids.push(c["id"].as_str().unwrap().to_string()); } } }
+        for w in r.sim.writes.iter().filter(|w| w.1 == "code") { ids.push(w.0.rsplit(':').next().unwrap().to_string()); }
+    }
+    assert!(!ids.is_empty());
+    for id in &ids { assert!(ok(id), "{id}"); }
+    let mut nodes: Vec<&String> = ids.iter().collect();
+    nodes.sort(); nodes.dedup();
+    // the two runs each made 4 distinct calls: the same step/round/call positions in a second run must not repeat an id
+    assert!(nodes.len() >= 8, "{nodes:?}");
+}
+
+// ---- the trail of the last step: `Loop:main.trail`
+
+fn trail(r: &Rig) -> Vec<J> { r.own(LOOP_ID, "trail").and_then(|v| v.as_array().cloned()).unwrap_or_default() }
+
+#[test]
+fn the_trail_has_each_rounds_visible_text_and_each_tool_call_with_whole_args_and_result() {
+    let mut r = Rig::new("t1", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(Ok(Reply { text: "<think>hidden</think>looking at it".into(), tool_calls: vec![ToolCall { name: "read".into(), arguments: json!({"id": "Message:7", "props": ["text"]}) }] }));
+    r.model.script.push_back(Ok(Reply { text: "all done".into(), tool_calls: vec![] }));
+    r.sim.ext("Message:7", "text", "THE-WHOLE-BODY");
+    r.drive(10);
+    let t = trail(&r);
+    assert_eq!(t.len(), 3, "{t:?}");
+    assert_eq!(t[0], json!({"step": 1, "round": 1, "text": "looking at it"}));
+    assert_eq!(t[1]["tool"], "read");
+    assert_eq!(t[1]["args"], json!({"id": "Message:7", "props": ["text"]}));
+    assert!(t[1]["result"].as_str().unwrap().contains("THE-WHOLE-BODY"));
+    assert_eq!(t[2], json!({"step": 1, "round": 2, "text": "all done"}));
+}
+
+#[test]
+fn the_trail_is_the_last_step_only_and_a_call_not_run_at_the_round_limit_is_in_it_as_not_run() {
+    let mut r = Rig::new("t2", Some("d"), BrainConfig { max_rounds: 1, ..cfg() });
+    r.drive(4);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(6);
+    assert_eq!(trail(&r).len(), 1, "round 1 said nothing and has no call");
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "n"}))]));
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(6);
+    let t = trail(&r);
+    assert_eq!(t.len(), 1, "{t:?}");
+    assert_eq!(t[0]["step"], 2);
+    assert!(t[0]["result"].as_str().unwrap().contains("not run"), "{t:?}");
+}
+
+#[test]
+fn a_trail_that_does_not_fit_the_peers_cell_drops_the_oldest_entries_and_says_how_many() {
+    let mut r = Rig::new("t3", Some("d"), BrainConfig { max_rounds: 40, ..cfg() });
+    r.drive(4);
+    let big = "y".repeat(1000);
+    for _ in 0..8 { r.model.script.push_back(calls(vec![("write", json!({"id": "Note:1", "prop": "p", "value": big}))])); }
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(60);
+    let t = trail(&r);
+    assert!(t[0]["dropped"].as_u64().unwrap() > 0, "{:?}", t.first());
+    assert!(serde_json::to_string(&t).unwrap().len() <= r.peer.val_cap() as usize);
+    assert!(t.last().unwrap()["text"] == "ok" && t.iter().any(|e| e["tool"] == "write"), "the newest entries are kept");
+}
+
+// ---- the banner, the tool rows and the skip rule
+
+const BANNER_MAIN: &str = "membrane::Banner:admin:main";
+fn banners(r: &mut Rig, main: &str, others: &[(&str, &str)]) {
+    r.sim.set_node(BANNER_MAIN, "text", json!(main));
+    for (eid, t) in others { r.sim.set_node(&format!("membrane::Banner:{eid}"), "text", json!(t)); }
+}
+
+#[test]
+fn the_loop_subscribes_to_the_banners_by_prefix_and_not_to_anything_the_seat_owes() {
+    let mut r = Rig::new("b0", Some("d"), cfg());
+    r.drive(4);
+    assert!(r.sim.prefix_subs.iter().any(|s| s == "membrane::Banner:"), "{:?}", r.sim.prefix_subs);
+    assert!(r.sim.subs.iter().all(|s| !s.contains("Owed")), "{:?}", r.sim.subs);
+}
+
+#[test]
+fn the_step_starts_with_the_main_banner_then_the_other_banners_in_banner_tags_then_the_changes() {
+    let mut r = Rig::new("b1", Some("d"), cfg());
+    banners(&mut r, "It is Thursday. You are Blurp.", &[("zeta", "second"), ("alpha", "first note"), ("empty", "  ")]);
+    r.drive(6);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    let u = user(&r.model.seen[0]);
+    assert!(u.starts_with("<banner>\nIt is Thursday. You are Blurp.\nfirst note\nsecond\n</banner>\n\nGraph changes"), "{u}");
+}
+
+#[test]
+fn an_edit_of_the_banner_shows_in_the_next_step_and_no_banner_is_no_block() {
+    let mut r = Rig::new("b2", Some("d"), cfg());
+    r.drive(4);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    assert!(!user(&r.model.seen[0]).contains("<banner>"));
+    banners(&mut r, "v1", &[]);
+    r.drive(4);
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(8);
+    assert!(user(&r.model.seen[1]).starts_with("<banner>\nv1\n</banner>"));
+    banners(&mut r, "v2, the model's own words", &[]);
+    r.drive(4);
+    r.sim.ext("Message:3", "text", "x");
+    r.drive(8);
+    assert!(user(&r.model.seen[2]).starts_with("<banner>\nv2, the model's own words\n</banner>"));
+}
+
+#[test]
+fn a_step_wakes_on_a_chat_message_row_and_only_on_an_outside_row_or_an_alarm() {
+    let mut r = Rig::new("b3", Some("d"), cfg());
+    r.drive(10);
+    assert!(r.model.seen.is_empty());
+    banners(&mut r, "a banner change alone is not a wake", &[]);
+    r.drive(10);
+    assert!(r.model.seen.is_empty());
+    r.sim.ext("membrane::Chat:main:message:1-1", "text", "hello");
+    r.drive(8);
+    assert_eq!(r.model.seen.len(), 1);
+    assert!(user(&r.model.seen[0]).contains("Chat:main:message:1-1.text"));
+}
+
+// ---- the tool rows of a step, in the person's chat, as the calls are issued
+
+const MSG: &str = "membrane::Chat:main:message:1-1";
+fn tool_nodes(r: &Rig) -> Vec<String> { let mut v: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "name" && w.0.contains(":turn:tool:")).map(|w| w.0.clone()).collect(); v.sort(); v }
+
+#[test]
+fn a_call_is_a_tool_row_under_the_turn_of_each_chat_message_the_step_was_shown_and_its_result_fills_in() {
+    let mut r = Rig::new("w1", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1 + 1"}))]));
+    r.sim.ext("membrane::Chat:main:message:1-1", "text", "one");
+    r.sim.ext("membrane::Chat:main:message:1-2", "text", "two");
+    r.drive(8);
+    let nodes = tool_nodes(&r);
+    assert_eq!(nodes.len(), 2, "{nodes:?}");
+    assert!(nodes[0].starts_with("membrane::Chat:main:message:1-1:turn:tool:") && nodes[1].starts_with("membrane::Chat:main:message:1-2:turn:tool:"), "{nodes:?}");
+    let id = nodes[0].rsplit(':').next().unwrap().to_string();
+    assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
+    for n in &nodes {
+        assert_eq!(r.sim.written(n, "name"), vec![json!("run_cliff")]);
+        assert_eq!(r.sim.written(n, "input"), vec![json!({"code": "1 + 1"})]);
+        assert!(r.sim.written(n, "result").is_empty(), "the result is not there before the call has run");
+    }
+    for m in ["1-1", "1-2"] { assert_eq!(r.sim.written(&format!("membrane::Chat:main:message:{m}"), "tool_ids"), vec![json!(id.clone())], "the message names its tools in the order called"); }
+    let cliff = cliff_node(&r);
+    r.sim.set_node(&cliff, "result", json!(2));
+    r.drive(10);
+    for n in &nodes { assert_eq!(r.sim.written(n, "result"), vec![json!("2")]); }
+}
+
+#[test]
+fn a_step_shown_no_chat_message_and_writing_to_no_response_writes_no_tool_rows() {
+    let mut r = Rig::new("w2", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "n"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
+    assert!(tool_nodes(&r).is_empty());
+    assert!(r.sim.writes.iter().all(|w| w.1 != "tool_ids"));
+}
+
+#[test]
+fn a_write_to_a_turns_response_puts_that_call_on_that_turn_and_the_later_calls_too() {
+    let mut r = Rig::new("w3", Some("d"), cfg());
+    r.drive(4);
+    let resp = format!("{MSG}:turn:response");
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi"}))]));
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 6, "note": "b"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(14);
+    let ids = r.sim.written(MSG, "tool_ids");
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    let (one, two) = (ids[0].as_str().unwrap(), ids[1].as_str().unwrap());
+    assert!(two.starts_with(one) && two.split(' ').count() == 2, "{ids:?}");
+    assert_eq!(tool_nodes(&r).len(), 2);
+}
+
+#[test]
+fn a_tool_row_the_seat_refuses_is_an_error_in_plain_words() {
+    let mut r = Rig::new("w4", Some("d"), cfg());
+    r.drive(4);
+    r.sim.refuse_for = Some(":turn:tool:".into());
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "a"}))]));
+    r.sim.ext("membrane::Chat:main:message:1-1", "text", "x");
+    r.drive(10);
+    let e = r.error().expect("shown");
+    assert!(e.contains("tool row") && e.contains("no tool rows for you"), "{e}");
+}
+
+#[test]
+fn a_second_write_to_the_same_node_and_property_in_one_step_is_skipped_with_no_write_and_no_row() {
+    let mut r = Rig::new("k1", Some("d"), cfg());
+    r.drive(4);
+    let resp = format!("{MSG}:turn:response");
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi"}))]));
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi again, differently"})), ("write", json!({"id": "Note:9", "prop": "text", "value": "other"})), ("write", json!({"id": resp, "prop": "other", "value": "p"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(16);
+    assert_eq!(r.sim.written(&resp, "text"), vec![json!("hi")], "the second write never reached the seat");
+    assert_eq!(r.sim.written("Note:9", "text"), vec![json!("other")], "a different node still goes through");
+    assert_eq!(r.sim.written(&resp, "other"), vec![json!("p")], "a different property too");
+    let told: Vec<String> = r.model.seen[2].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert!(told.iter().any(|t| t == "skipped: this node and property were already written in this step"), "{told:?}");
+    assert_eq!(tool_nodes(&r).len(), 3, "rows for the three writes that went out, none for the skipped one: {:?}", tool_nodes(&r));
+}
+
+
+// ---- the live view of the round being generated: `Loop:main.live`
+
+/// A model that writes its round in pieces and looks at the loop's `live` cell after each one, as the seat would between two of its turns.
+struct Chunked { pieces: Vec<String>, reader: Option<CellsReader>, name: String, partials: Vec<String> }
+impl Model for Chunked {
+    fn step(&mut self, _m: &[J], _t: &[J]) -> Result<Reply, String> { self.step_live(_m, _t, &mut |_| {}) }
+    fn step_live(&mut self, _m: &[J], _t: &[J], on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+        if self.reader.is_none() { self.reader = CellsReader::attach(format!("/gl-{}-pc", self.name)).ok(); }
+        for p in self.pieces.clone() {
+            on_text(&p);
+            self.partials.push(cell(self.reader.as_ref().unwrap(), LOOP_ID, "live").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "<none>".into()));
+        }
+        Ok(Reply { text: self.pieces.concat(), tool_calls: vec![] })
+    }
+}
+
+fn live_rig(tag: &str, pieces: Vec<String>) -> (Sim, Peer, Brain, Chunked) {
+    let (mut sim, mut peer) = Sim::new(tag, Some("d"));
+    let mut brain = Brain::new(cfg(), "membrama");
+    let mut model = Chunked { pieces, reader: None, name: sim.seat.name.clone(), partials: vec![] };
+    for i in 0..4 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 1_000 + i * 10).unwrap(); }
+    (sim, peer, brain, model)
+}
+
+#[test]
+fn the_text_of_the_round_so_far_is_published_as_it_grows_and_cleared_when_the_round_ends() {
+    let (mut sim, mut peer, mut brain, mut model) = live_rig("v1", vec!["<think>hm".into(), "m</think>Hel".into(), "lo".into()]);
+    sim.ext("Message:1", "text", "x");
+    for i in 0..6 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 2_000 + i * 10).unwrap(); }
+    assert_eq!(model.partials, vec!["<think>hm", "<think>hmm</think>Hel", "<think>hmm</think>Hello"], "thinking included, not stripped; it grows");
+    assert_eq!(cell(&sim.seat.reader(), LOOP_ID, "live"), Some(json!("")), "cleared at the end of the round");
+}
+
+#[test]
+fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker() {
+    let cap = membrama::peer::Numbers { slots: 0, key_cap: 0, val_cap: 4096, epoch: 0, spins: 0, depth: 0 }.val_cap as usize;
+    let piece = "abcdefghij".repeat(150);
+    let (mut sim, mut peer, mut brain, mut model) = live_rig("v2", vec![piece.clone(), piece.clone(), piece.clone(), piece.clone(), "THE-END".into()]);
+    sim.ext("Message:1", "text", "x");
+    for i in 0..6 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 2_000 + i * 10).unwrap(); }
+    assert!(model.partials.iter().all(|p| serde_json::to_string(p).unwrap().len() <= cap), "never above val_cap");
+    let last = model.partials.last().unwrap();
+    assert!(last.starts_with("[\u{2026}earlier text dropped]\n") && last.ends_with("THE-END"), "{}", &last[..40]);
+}
+

@@ -1,13 +1,13 @@
 //! The loop (docs/design.md, "The loop"): membrama as an always-on co-processor on its own clock. It reads the seat's boundary log through the seat's LogView
 //! (it asks by writing its own `membrama::LogAsk:main`, and reads `rows`: pointers, never values), builds its own step prompt (the doctrine, a node of the seat's
-//! that the operator can edit, and the delta rows), calls its model, and acts with four tools over the link: write (`wr`), read, query (`q`) and alarm.
+//! that the operator can edit, and the delta rows), calls its model, and acts with four tools over the link: write (`wr`), read (from the cells the seat publishes), alarm and run_cliff.
 //! Sans-I/O like the rest of the peer: `tick` is called by whoever owns the thread. A step is a few model calls (a round each, bounded by the owner) and
 //! nothing is kept from one step to the next: doctrine + delta is the whole contract.
 use crate::peer::{Peer, Seen};
 use crate::template::{render, Options};
-use crate::toolcall::{detect_format, parse, ToolCall};
+use crate::toolcall::{detect_format, parse, visible, ToolCall};
 use crate::turn::{Generator, Job, Part, PartKind};
-use graphlink_core::frame::{Op, QueryBy, Target, ValBody};
+use graphlink_core::frame::{Op, Target};
 use graphlink_core::link::Event;
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
@@ -36,7 +36,11 @@ pub struct BrainConfig {
 pub struct Reply { pub text: String, pub tool_calls: Vec<ToolCall> }
 
 /// Whatever turns a step's messages (OpenAI shape) and tools into a reply: the real one is `TemplateModel`; a test uses a stub.
-pub trait Model { fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String>; }
+pub trait Model {
+    fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String>;
+    /// The same call, handing each piece of text to `on_text` as the model writes it (the loop shows the round's text so far); a model that cannot stream hands nothing.
+    fn step_live(&mut self, messages: &[J], tools: &[J], _on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> { self.step(messages, tools) }
+}
 
 /// The seat's node holding the doctrine (its `text` is the words a step starts with). The operator edits it there; membrama writes the first draft only when the node does not exist.
 pub const DOCTRINE_ID: &str = "membrane::Doctrine:membrama";
@@ -45,7 +49,14 @@ pub const DOCTRINE_DRAFT: &str = include_str!("brain/doctrine.md");
 /// The loop's own node in membrama's namespace: `cursor`, `steps`, `said` (the last words of a step) and `error` (what last went wrong, in plain words; null when the last step was clean).
 pub const LOOP_ID: &str = "membrama::Loop:main";
 const ASK_ID: &str = "membrama::LogAsk:main";
+/// The seat's banners, read from their cells: the main one is `membrane::Banner:admin:main` (`text`), the others are `membrane::Banner:<name>` (their `text` shows their `words`).
+const BANNERS: &str = "membrane::Banner:";
+const MAIN_BANNER: &str = "membrane::Banner:admin:main";
+/// The result of a write to a node and property this step has already written.
+const SKIPPED: &str = "skipped: this node and property were already written in this step";
 const ALARM: &str = "membrama::Alarm:";
+/// The seat's node a clifflet is run on: `membrane::Cliff:<ns>:<call id>` (the peer writes `code`; the seat's runner writes `result` or `error`).
+const CLIFF: &str = "membrane::Cliff:";
 /// The names of the two packs written to the seat on connect.
 pub const VIEWER_PACK: &str = "membrama_logview";
 pub const GUARD_PACK: &str = "membrama_logguard";
@@ -67,8 +78,8 @@ pub fn tool_specs() -> Vec<J> {
     vec![
         f("write", "Set one property of a node.", json!({"type": "object", "properties": {"id": {"type": "string"}, "prop": {"type": "string"}, "value": {}}, "required": ["id", "prop", "value"]})),
         f("read", "Read some properties of a node.", json!({"type": "object", "properties": {"id": {"type": "string"}, "props": {"type": "array", "items": {"type": "string"}}}, "required": ["id", "props"]})),
-        f("query", "List nodes whose id starts with a prefix, or that belong to a class (one of the two).", json!({"type": "object", "properties": {"prefix": {"type": "string"}, "class": {"type": "string"}, "after": {"type": "string"}, "limit": {"type": "integer"}}})),
         f("alarm", "Wake yourself after a number of seconds, with a note. Time reaches you only this way.", json!({"type": "object", "properties": {"after_seconds": {"type": "number"}, "note": {"type": "string"}}, "required": ["after_seconds", "note"]})),
+        f("run_cliff", "Run a clifflet (cliffhanger code) on the seat and get its value back, or the error. Use it to program a behaviour onto the graph.", json!({"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]})),
     ]
 }
 
@@ -85,12 +96,14 @@ impl Row {
 struct Alarm { id: u64, at_ms: u64, note: String }
 
 /// What an op waiting for the seat's answer is, so the answer can be told in the right words.
-enum Inflight { Write { id: String, prop: String }, Read, Query, System(String) }
+enum Inflight { Write { id: String, prop: String }, System(String), Cliff, Quiet }
 
 /// A tool call of the current round: its result, or the id of the op that will bring it.
-enum Pend { Done(String), Wait(String) }
+enum Pend { Done(String), Wait { id: String, what: String }, Cliff { node: String, wid: String } }
 
-struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, failed: bool }
+/// `slots`: for each pending call, the place of its entry in the trail.
+struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, slots: Vec<usize>, failed: bool, wrote: Vec<(String, String)>, turns: Vec<(String, String, Vec<String>)>, call_ids: Vec<String>, issued: Vec<String> }
+
 
 pub struct Brain {
     cfg: BrainConfig,
@@ -113,6 +126,12 @@ pub struct Brain {
     steps: u64,
     error: Option<String>,
     published_cursor: Option<u64>,
+    /// the wall clock at construction, in milliseconds, in hex: part of every call id so a restart (the step counter starts at 0 again) cannot repeat one
+    run: String,
+    waiting: Option<String>,
+    /// the last step's trail: for each round the model's visible text, for each tool call `{step, round, tool, args, result}`
+    trail: Vec<J>,
+    published_trail: Option<String>,
 }
 
 /// The writer the seat records for a write this peer makes (`link:<namespace>`): the lines in the log with it are the loop's own.
@@ -122,7 +141,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, trail: vec![], published_trail: None,
         }
     }
 
@@ -137,18 +156,12 @@ impl Brain {
         self.run(peer, model)
     }
 
-    /// Records what the seat answered: the result of a write, a read or a query, in words for the model.
+    /// Records what the seat answered: the result of a write, in words for the model.
     fn absorb(&mut self, peer: &mut Peer, events: &[Event]) {
         for e in events {
             let Event::Op(op) = e else { continue };
             let (id, text) = match op {
                 Op::Res { wid, refused } => (wid.clone(), match refused { None => "ok".to_string(), Some(why) => format!("refused: {why}") }),
-                Op::Val { rid: Some(rid), body, .. } => (rid.clone(), match body {
-                    ValBody::Props(p) => p.to_string(),
-                    ValBody::Gone => "there is no such node".to_string(),
-                    ValBody::Refused(why) => format!("not shown: {why}"),
-                }),
-                Op::Page { qid, rows, next, total } => (qid.clone(), json!({"rows": rows, "next": next, "total": total}).to_string()),
                 _ => continue,
             };
             match self.inflight.remove(&id) {
@@ -157,7 +170,9 @@ impl Brain {
                     if let Some(why) = text.strip_prefix("refused: ") { self.fail(peer, &format!("write to {eid}.{prop} refused: {why}")); }
                     self.answers.insert(id, text);
                 }
-                Some(_) => { self.answers.insert(id, text); }
+                // the write of a cliff's code: an ok says nothing (the result comes on the node), a refusal ends the call
+                Some(Inflight::Cliff) => { if text.starts_with("refused: ") { self.answers.insert(id, text); } }
+                Some(Inflight::Quiet) => {}
                 None => {}
             }
         }
@@ -177,6 +192,7 @@ impl Brain {
         if !self.subscribed {
             peer.subscribe(Target::Id(format!("membrane::LogView:{}", self.ns)), None)?;
             peer.subscribe(Target::Id(DOCTRINE_ID.into()), None)?;
+            peer.subscribe(Target::Prefix(BANNERS.into()), None)?;
             for (pack, text, what) in [(GUARD_PACK, guard_pack(&self.ns), "the guard pack"), (VIEWER_PACK, viewer_pack(&self.ns), "the log tab pack")] {
                 let wid = peer.write(&format!("Pack:{pack}"), "text", &json!(text))?;
                 self.inflight.insert(wid, Inflight::System(what.into()));
@@ -204,7 +220,11 @@ impl Brain {
                 Seen::Live(rows) => {
                     let cursor = self.cursor.unwrap_or(0);
                     for r in rows.as_array().into_iter().flatten() {
-                        if self.backlog.len() >= self.cfg.delta_cap { break; }
+                        if self.backlog.len() >= self.cfg.delta_cap {
+                            // a full backlog is drained by a step, and only an outside line wakes one: held lines that are all its own are context, so the oldest makes room
+                            if self.backlog.iter().any(|b| !b.own) { break; }
+                            self.backlog.remove(0);
+                        }
                         let Some(n) = r.get("n").and_then(J::as_u64) else { continue };
                         if n < cursor { continue; }
                         let text = |k: &str| r.get(k).and_then(J::as_str).unwrap_or("").to_string();
@@ -227,6 +247,21 @@ impl Brain {
         Ok(())
     }
 
+    /// The banner as the chat shows it to the model: the main banner's `text`, then the other banners' `text` in the order of their ids, the non-empty ones, one per line. Read from the cells
+    /// the seat publishes, so the model's own edits of its banner show in the next step.
+    fn banner(&self, peer: &Peer) -> Result<String, String> {
+        let mut main = String::new();
+        let mut more: Vec<(String, String)> = vec![];
+        for (eid, prop, v) in peer.scan(BANNERS)? {
+            let Some(t) = v.as_str().map(str::trim).filter(|t| !t.is_empty()) else { continue };
+            if prop != "text" { continue; }
+            if eid == MAIN_BANNER { main = t.to_string(); } else { more.push((eid, t.to_string())); }
+        }
+        more.sort();
+        let parts: Vec<String> = std::iter::once(main).chain(more.into_iter().map(|(_, t)| t)).filter(|t| !t.is_empty()).collect();
+        Ok(parts.join("\n"))
+    }
+
     fn fire_alarms(&mut self, peer: &mut Peer) -> Result<(), String> {
         let (due, later): (Vec<Alarm>, Vec<Alarm>) = std::mem::take(&mut self.alarms).into_iter().partition(|a| a.at_ms <= self.now);
         self.alarms = later;
@@ -247,6 +282,13 @@ impl Brain {
                 Seen::Absent => { self.fail(peer, &format!("there is no doctrine on the seat ({DOCTRINE_ID}.text); a step waits for it")); return Ok(()); }
             };
             let mut delta = String::new();
+            let banner = self.banner(peer)?;
+            if !banner.is_empty() { delta.push_str(&format!("<banner>\n{banner}\n</banner>\n\n")); }
+            // the person's chat shows a step's calls under the turn of each chat message the step was shown (a line for the message's own `text` that is not the loop's)
+            let mut turns: Vec<(String, String, Vec<String>)> = vec![];
+            for r in self.backlog.iter().filter(|r| !r.own && r.prop == "text") {
+                if let Some(m) = message_eid(&r.eid) { if r.eid == m && !turns.iter().any(|(x, _, _)| *x == m) { turns.push((m.clone(), format!("{m}:turn"), vec![])); } }
+            }
             if !self.backlog.is_empty() {
                 delta.push_str("Graph changes since your last step (pointers only; read a node to see its value):\n");
                 for r in self.backlog.drain(..) { delta.push_str(&r.line()); delta.push('\n'); }
@@ -255,7 +297,8 @@ impl Brain {
                 delta.push_str("Alarms that went off:\n");
                 for (id, note) in self.fired.drain(..) { delta.push_str(&format!("alarm {id}: {note}\n")); }
             }
-            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], failed: false });
+            self.step = Some(Step { messages: vec![json!({"role": "system", "content": doctrine}), json!({"role": "user", "content": delta})], round: 0, pending: vec![], slots: vec![], failed: false, wrote: vec![], turns, call_ids: vec![], issued: vec![] });
+            self.trail.clear();
             return self.round(peer, model);
         }
         self.settle(peer, model)
@@ -264,10 +307,34 @@ impl Brain {
     /// The current round's tool results, once every one has come: they go into the conversation and the model is called again.
     fn settle(&mut self, peer: &mut Peer, model: &mut dyn Model) -> Result<(), String> {
         let Some(step) = &mut self.step else { return Ok(()) };
+        let mut retire: Vec<String> = vec![];
         for p in step.pending.iter_mut() {
-            if let Pend::Wait(id) = p { if let Some(t) = self.answers.remove(id.as_str()) { *p = Pend::Done(t); } }
+            match p {
+                Pend::Wait { id, .. } => { if let Some(t) = self.answers.remove(id.as_str()) { *p = Pend::Done(t); } }
+                Pend::Cliff { node, wid } => {
+                    let done = if let Some(t) = self.answers.remove(wid.as_str()) { Some((t, false)) } else {
+                        match (peer.seen(node, "result")?, peer.seen(node, "error")?) {
+                            (Seen::Live(v), _) => Some((match v { J::String(t) => t, other => other.to_string() }, true)),
+                            (_, Seen::Live(J::Null)) | (_, Seen::Absent) => None,
+                            (_, Seen::Live(e)) => Some((format!("error: {}", match e { J::String(t) => t, other => other.to_string() }), true)),
+                            (_, Seen::Refused(why)) => Some((format!("error: the answer could not be read: {why}"), true)),
+                        }
+                    };
+                    if let Some((t, answered)) = done { if answered { retire.push(node.clone()); } *p = Pend::Done(t); }
+                }
+                _ => {}
+            }
         }
-        if step.pending.iter().any(|p| matches!(p, Pend::Wait(_))) { return Ok(()); }
+        for node in retire {
+            // the runner retires the node when the peer retires it (a write of `retire`); this peer stops reading it
+            let wid = peer.write(&node, "retire", &json!(true))?;
+            self.inflight.insert(wid, Inflight::Quiet);
+            peer.unsubscribe(Target::Id(node))?;
+        }
+        self.show_waiting(peer)?;
+        self.record_results(peer)?;
+        let Some(step) = &mut self.step else { return Ok(()) };
+        if step.pending.iter().any(|p| matches!(p, Pend::Wait { .. } | Pend::Cliff { .. })) { return Ok(()); }
         for p in std::mem::take(&mut step.pending) { if let Pend::Done(t) = p { step.messages.push(json!({"role": "tool", "content": t})); } }
         self.round(peer, model)
     }
@@ -277,34 +344,166 @@ impl Brain {
         let Some(step) = &mut self.step else { return Ok(()) };
         step.round += 1;
         let round = step.round;
-        let reply = match model.step(&step.messages, &self.tools) {
+        // the round so far goes to `live` with every piece the model writes (as the chat turn handler publishes each chunk, src/turn.rs), the tail kept when it would not fit the peer's cell
+        let cap = peer.val_cap() as usize;
+        let mut live = String::new();
+        let mut live_err: Option<String> = None;
+        let result = model.step_live(&step.messages, &self.tools, &mut |piece: &str| {
+            live.push_str(piece);
+            if live_err.is_none() { if let Err(e) = peer.publish(LOOP_ID, "live", &json!(live_tail(&live, cap))) { live_err = Some(e); } }
+        });
+        if !live.is_empty() || live_err.is_some() { peer.publish(LOOP_ID, "live", &json!(""))?; }
+        if let Some(e) = live_err { self.fail(peer, &format!("the live view of the round could not be written: {e}")); }
+        let reply = match result {
             Ok(r) => r,
             Err(e) => { self.fail(peer, &format!("the model call failed: {e}")); return self.finish(peer, None); }
         };
-        if reply.tool_calls.is_empty() { return self.finish(peer, Some(reply.text)); }
+        let seen = visible(&reply.text);
+        let no = self.steps + 1;
+        if !seen.is_empty() { eprintln!("membrama: step {no} round {round} said {seen}"); self.trail.push(json!({"step": no, "round": round, "text": seen})); }
+        if reply.tool_calls.is_empty() { self.show_trail(peer)?; return self.finish(peer, Some(reply.text)); }
         if round >= self.cfg.max_rounds {
+            for c in &reply.tool_calls { self.trail_call(no, round, c, "not run: the step ended at the round limit"); }
+            self.show_trail(peer)?;
             self.fail(peer, &format!("the step ended after {} rounds with the model still asking for tools; those calls were not run", self.cfg.max_rounds));
             return self.finish(peer, Some(reply.text));
         }
-        let calls: Vec<J> = reply.tool_calls.iter().enumerate().map(|(i, c)| json!({"id": format!("call_{round}_{i}"), "type": "function", "function": {"name": c.name, "arguments": c.arguments}})).collect();
+        let calls: Vec<J> = reply.tool_calls.iter().enumerate().map(|(i, c)| json!({"id": self.call_id(round, i), "type": "function", "function": {"name": c.name, "arguments": c.arguments}})).collect();
         if let Some(step) = &mut self.step { step.messages.push(json!({"role": "assistant", "content": reply.text, "tool_calls": calls})); }
         let mut pending = Vec::new();
-        for c in &reply.tool_calls { pending.push(self.call(peer, c)?); }
-        if let Some(step) = &mut self.step { step.pending = pending; }
+        let mut slots = Vec::new();
+        let mut call_ids = Vec::new();
+        for (i, c) in reply.tool_calls.iter().enumerate() {
+            slots.push(self.trail.len());
+            call_ids.push(self.call_id(round, i));
+            let skip = self.skipped(c);
+            if !skip {
+                if let (Some(step), "write", Some(id), Some(prop)) = (&mut self.step, c.name.as_str(), c.arguments.get("id").and_then(J::as_str), c.arguments.get("prop").and_then(J::as_str)) { step.wrote.push((id.to_string(), prop.to_string())); }
+                self.show_call(peer, &self.call_id(round, i), c)?;
+            }
+            self.trail.push(json!({"step": no, "round": round, "tool": c.name, "args": c.arguments}));
+            pending.push(if skip { Pend::Done(SKIPPED.to_string()) } else { self.call(peer, c, &self.call_id(round, i))? });
+        }
+        if let Some(step) = &mut self.step { step.pending = pending; step.slots = slots; step.call_ids.extend(call_ids); }
+        self.record_results(peer)?;
+        self.show_waiting(peer)
+    }
+
+    /// Writes one property of the tool row of call `id` under each turn the step was shown (nothing when it was shown none). The seat's answer to a refused write is in `error`.
+    fn write_rows(&mut self, peer: &mut Peer, id: &str, prop: &str, value: J, what: &str) -> Result<(), String> {
+        let turns: Vec<String> = self.step.as_ref().map(|s| s.turns.iter().filter(|(_, _, ids)| ids.iter().any(|i| i == id)).map(|(_, t, _)| t.clone()).collect()).unwrap_or_default();
+        for t in turns {
+            let wid = peer.write(&format!("{t}:tool:{id}"), prop, &value)?;
+            self.inflight.insert(wid, Inflight::System(format!("the tool row of a call under {t} ({what})")));
+        }
+        Ok(())
+    }
+
+    /// The call as the person's chat shows it, at the moment it is issued: a row `<turn>:tool:<call id>` with `name` and `input` under each turn of the step, and the messages' `tool_ids`
+    /// (the ids in the order called, which is how the chat lists a message's tools, packs/chat.c1f `tool_keys`). The turns of a step are those of the chat messages it was shown as change lines, and the
+    /// turn named by a write to a `...:turn:response` (from that call on).
+    fn show_call(&mut self, peer: &mut Peer, id: &str, c: &ToolCall) -> Result<(), String> {
+        let Some(step) = &mut self.step else { return Ok(()) };
+        if let Some(t) = (c.name == "write").then(|| c.arguments.get("id").and_then(J::as_str)).flatten().and_then(|e| e.strip_suffix(":response")) {
+            if let Some(m) = t.strip_suffix(":turn") { if !step.turns.iter().any(|(x, _, _)| x == m) { step.turns.push((m.to_string(), t.to_string(), vec![])); } }
+        }
+        if step.turns.is_empty() { return Ok(()); }
+        for (_, _, ids) in step.turns.iter_mut() { ids.push(id.to_string()); }
+        step.issued.push(id.to_string());
+        let lists: Vec<(String, String)> = step.turns.iter().map(|(m, _, ids)| (m.clone(), ids.join(" "))).collect();
+        self.write_rows(peer, id, "name", json!(c.name), "its name")?;
+        self.write_rows(peer, id, "input", c.arguments.clone(), "its input")?;
+        for (m, ids) in lists {
+            let wid = peer.write(&m, "tool_ids", &json!(ids))?;
+            self.inflight.insert(wid, Inflight::System(format!("the list of the tools of {m}")));
+        }
+        Ok(())
+    }
+
+    /// A second write to the same node and property in one step is not sent: the first stands for the step.
+    fn skipped(&self, c: &ToolCall) -> bool {
+        let (Some(step), "write") = (&self.step, c.name.as_str()) else { return false };
+        let a = &c.arguments;
+        let (Some(id), Some(prop)) = (a.get("id").and_then(J::as_str), a.get("prop").and_then(J::as_str)) else { return false };
+        step.wrote.iter().any(|(i, p)| i == id && p == prop)
+    }
+
+    /// A call that was not run: its entry in the trail, with the reason as its result.
+    fn trail_call(&mut self, no: u64, round: usize, c: &ToolCall, result: &str) {
+        eprintln!("membrama: step {no} round {round} {} {} -> {result}", c.name, c.arguments);
+        self.trail.push(json!({"step": no, "round": round, "tool": c.name, "args": c.arguments, "result": result}));
+    }
+
+    /// Puts the result of each call that has one into its trail entry (and on stderr), once.
+    fn record_results(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let Some(step) = &self.step else { return Ok(()) };
+        let no = self.steps + 1;
+        let mut rows: Vec<(String, String)> = vec![];
+        let first = step.call_ids.len().saturating_sub(step.pending.len());
+        for (k, (p, slot)) in step.pending.iter().zip(step.slots.iter()).enumerate() {
+            let Pend::Done(t) = p else { continue };
+            let Some(e) = self.trail.get_mut(*slot) else { continue };
+            if e.get("result").is_some() { continue; }
+            if let Some(id) = step.call_ids.get(first + k).filter(|id| step.issued.contains(id)) { rows.push((id.clone(), t.clone())); }
+            eprintln!("membrama: step {no} round {} {} {} -> {t}", e["round"], e["tool"].as_str().unwrap_or(""), e["args"]);
+            e["result"] = json!(t);
+        }
+        for (id, t) in rows { self.write_rows(peer, &id, "result", json!(t), "its result")?; }
+        self.show_trail(peer)
+    }
+
+    /// Publishes the trail when it changed. A trail the peer's cells cannot hold gives up its oldest entries, and says how many (`{dropped: n}`).
+    fn show_trail(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let cap = peer.val_cap() as usize;
+        let fits = |v: &[J]| serde_json::to_string(v).map_or(false, |t| t.len() <= cap);
+        let mut shown = self.trail.clone();
+        for k in 1..=self.trail.len() {
+            if fits(&shown) { break; }
+            shown = std::iter::once(json!({"dropped": k})).chain(self.trail[k..].iter().cloned()).collect();
+        }
+        let text = serde_json::to_string(&shown).unwrap_or_default();
+        if self.published_trail.as_deref() != Some(text.as_str()) { peer.publish(LOOP_ID, "trail", &J::Array(shown))?; self.published_trail = Some(text); }
+        Ok(())
+    }
+
+    /// A tool call's id: letters and digits only (the seat's runner makes it part of pack names and refuses anything else), and different for each run of the process, step, round and call.
+    fn call_id(&self, round: usize, i: usize) -> String { format!("c{}s{}r{round}n{i}", self.run, self.steps) }
+
+    /// Says on the loop's node what the step in hand is waiting for (null when it waits for nothing): a wait has no timeout, so it must be seen.
+    fn show_waiting(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let now: Option<String> = self.step.as_ref().and_then(|s| {
+            let w: Vec<String> = s.pending.iter().filter_map(|p| match p {
+                Pend::Wait { what, .. } => Some(what.clone()),
+                Pend::Cliff { node, .. } => Some(format!("run_cliff on {node} (`result` or `error` from the seat's runner)")),
+                Pend::Done(_) => None,
+            }).collect();
+            if w.is_empty() { None } else { Some(format!("waiting for the answer to: {}", w.join("; "))) }
+        });
+        if now != self.waiting { peer.publish(LOOP_ID, "waiting", &now.as_ref().map_or(J::Null, |t| json!(t)))?; self.waiting = now; }
         Ok(())
     }
 
     fn finish(&mut self, peer: &mut Peer, said: Option<String>) -> Result<(), String> {
         let failed = self.step.take().map(|s| s.failed).unwrap_or(false);
+        self.show_waiting(peer)?;
         self.steps += 1;
         peer.publish(LOOP_ID, "steps", &json!(self.steps))?;
-        if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(strip_thinking(&t)))?; }
+        if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(live_tail(&strip_thinking(&t), peer.val_cap() as usize)))?; }   // without its thinking block; longer than the cell: its tail, as `live` does; a write that cannot fit must not end the loop
         if !failed && self.error.is_some() { self.error = None; peer.publish(LOOP_ID, "error", &J::Null)?; }
         Ok(())
     }
 
+    /// Runs a clifflet on the seat's runner (babyseat): writes its code to `membrane::Cliff:<ns>:<call id>`; the answer is `result` or `error` on that node.
+    fn start_cliff(&mut self, peer: &mut Peer, code: &str, call_id: &str) -> Result<Pend, String> {
+        let node = format!("{CLIFF}{}:{call_id}", self.ns);
+        peer.subscribe(Target::Id(node.clone()), None)?;
+        let wid = peer.write(&node, "code", &json!(code))?;
+        self.inflight.insert(wid.clone(), Inflight::Cliff);
+        Ok(Pend::Cliff { node, wid })
+    }
+
     /// Starts one tool call. A call that cannot be made says why, in words the model reads as the result.
-    fn call(&mut self, peer: &mut Peer, c: &ToolCall) -> Result<Pend, String> {
+    fn call(&mut self, peer: &mut Peer, c: &ToolCall, call_id: &str) -> Result<Pend, String> {
         let a = &c.arguments;
         let text = |k: &str| a.get(k).and_then(J::as_str).map(String::from);
         let missing = |k: &str| Ok(Pend::Done(format!("error: {} needs `{k}`", c.name)));
@@ -314,26 +513,25 @@ impl Brain {
                 let Some(prop) = text("prop") else { return missing("prop") };
                 let Some(value) = a.get("value") else { return missing("value") };
                 let wid = peer.write(&id, &prop, value)?;
+                let what = format!("write of {id}.{prop}");
                 self.inflight.insert(wid.clone(), Inflight::Write { id, prop });
-                Ok(Pend::Wait(wid))
+                Ok(Pend::Wait { id: wid, what })
             }
             "read" => {
                 let Some(id) = text("id") else { return missing("id") };
                 let Some(props) = a.get("props").and_then(J::as_array) else { return missing("props") };
                 let props: Vec<String> = props.iter().filter_map(J::as_str).map(String::from).collect();
-                let rid = peer.read_req(&id, &props)?;
-                self.inflight.insert(rid.clone(), Inflight::Read);
-                Ok(Pend::Wait(rid))
+                // a clifflet: one dict of `prop` reads; a missing prop or node reads as null. The names go inside single quotes, and no escape is known for the others, so those are refused.
+                let plain = |t: &str| !t.chars().any(|c| c == '\'' || c == '\\' || c.is_control());
+                if !plain(&id) || !props.iter().all(|p| plain(p)) {
+                    return Ok(Pend::Done("error: read cannot take a node id or property with a single quote, a backslash or a control character (they are written inside quotes with no escape); use run_cliff with your own code".into()));
+                }
+                let entries: Vec<String> = props.iter().map(|p| format!("'{p}': prop('{id}', '{p}')")).collect();
+                self.start_cliff(peer, &format!("{{{}}}", entries.join(", ")), call_id)
             }
-            "query" => {
-                let by = match (text("prefix"), text("class")) {
-                    (Some(p), None) => QueryBy::Prefix(p),
-                    (None, Some(k)) => QueryBy::Class(k),
-                    _ => return Ok(Pend::Done("error: query needs exactly one of `prefix` and `class`".into())),
-                };
-                let qid = peer.query(by, text("after"), a.get("limit").and_then(J::as_u64))?;
-                self.inflight.insert(qid.clone(), Inflight::Query);
-                Ok(Pend::Wait(qid))
+            "run_cliff" => {
+                let Some(code) = text("code") else { return missing("code") };
+                self.start_cliff(peer, &code, call_id)
             }
             "alarm" => {
                 let Some(secs) = a.get("after_seconds").and_then(J::as_f64).filter(|s| *s >= 0.0) else { return missing("after_seconds") };
@@ -347,8 +545,22 @@ impl Brain {
                 self.alarms.push(Alarm { id, at_ms: at, note });
                 Ok(Pend::Done(format!("alarm {id} set for {secs} seconds from now")))
             }
-            other => Ok(Pend::Done(format!("error: there is no tool named `{other}`; the tools are write, read, query and alarm"))),
+            other => Ok(Pend::Done(format!("error: there is no tool named `{other}`; the tools are write, read, alarm and run_cliff"))),
         }
+    }
+}
+
+/// What shows of the round's text so far in a cell of `cap` bytes (its JSON text, a bound on the cell's size): all of it, or its tail after a marker line.
+fn live_tail(text: &str, cap: usize) -> String {
+    let fits = |t: &str| serde_json::to_string(t).map_or(false, |j| j.len() <= cap);
+    if fits(text) { return text.to_string(); }
+    const MARK: &str = "[\u{2026}earlier text dropped]\n";
+    let mut start = text.len().saturating_sub(cap.saturating_sub(MARK.len() + 2));
+    loop {
+        while start < text.len() && !text.is_char_boundary(start) { start += 1; }
+        let shown = format!("{MARK}{}", &text[start..]);
+        if fits(&shown) || start >= text.len() { return shown; }
+        start += (serde_json::to_string(&shown).map_or(0, |j| j.len()) - cap).max(1);
     }
 }
 
@@ -356,17 +568,25 @@ impl Brain {
 pub struct TemplateModel<'a> { pub generator: &'a mut dyn Generator, pub max_new: usize }
 
 impl Model for TemplateModel<'_> {
-    fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String> {
+    fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String> { self.step_live(messages, tools, &mut |_| {}) }
+    fn step_live(&mut self, messages: &[J], tools: &[J], on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
         let template = self.generator.chat_template().ok_or("the model has no chat template, so a step cannot be rendered")?;
         let format = detect_format(&template);
         if !tools.is_empty() && format.is_none() { return Err("tools are not supported for this model: the format its replies use for tool calls is not known".into()); }
         let text = render(&template, messages, tools, &Options { add_generation_prompt: true, enable_thinking: None })?;
         let job = Job { id: "loop".into(), server: String::new(), parts: vec![Part { kind: PartKind::Text, text }], max_new: self.max_new, chat: Some(format) };
         let mut said = String::new();
-        self.generator.generate(&job, &mut |piece: &str| { said.push_str(piece); true })?;
+        self.generator.generate(&job, &mut |piece: &str| { said.push_str(piece); on_text(piece); true })?;
         match format {
             Some(f) => { let p = parse(&said, f)?; Ok(Reply { text: p.content, tool_calls: p.tool_calls }) }
             None => Ok(Reply { text: said.trim().to_string(), tool_calls: vec![] }),
         }
     }
+}
+
+/// The chat message an entity id belongs to (`<...>:message:<id>` and what is under it), or none.
+fn message_eid(eid: &str) -> Option<String> {
+    let at = eid.find(":message:")? + ":message:".len();
+    let end = eid[at..].find(':').map_or(eid.len(), |i| at + i);
+    (end > at).then(|| eid[..end].to_string())
 }

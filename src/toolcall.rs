@@ -50,3 +50,17 @@ fn one(body: &str) -> Result<ToolCall, String> {
     };
     Ok(ToolCall { name, arguments })
 }
+
+/// What a reply says to a reader: the model's thinking removed (a `<think>` block, or the text before a lone `</think>` when the template opened the block in the prompt), the rest trimmed.
+pub fn visible(text: &str) -> String {
+    let mut t = text;
+    if let Some(i) = t.rfind("</think>") { t = &t[i + "</think>".len()..]; }
+    let mut out = String::new();
+    let mut rest = t;
+    while let Some(i) = rest.find("<think>") {
+        out.push_str(&rest[..i]);
+        match rest[i..].find("</think>") { Some(e) => rest = &rest[i + e + "</think>".len()..], None => { rest = ""; break; } }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
