@@ -22,6 +22,7 @@ struct Sim {
     journal: Vec<J>,
     writes: Vec<(String, String, J)>,
     subs: Vec<String>,
+    prefix_subs: Vec<String>,
     refuse: Option<String>,
     /// refuse only the writes to nodes whose id holds this text
     refuse_for: Option<String>,
@@ -35,7 +36,7 @@ impl Sim {
     fn new(tag: &str, doctrine: Option<&str>) -> (Sim, Peer) {
         let seat = FakeSeat::start(tag);
         let mut peer = seat.peer();
-        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], refuse: None, refuse_for: None, reader: None, served_n: -1.0, rows_too_big: false };
+        let mut sim = Sim { seat, nodes: HashMap::new(), journal: vec![], writes: vec![], subs: vec![], prefix_subs: vec![], refuse: None, refuse_for: None, reader: None, served_n: -1.0, rows_too_big: false };
         if let Some(d) = doctrine { sim.nodes.entry(DOCTRINE_ID.into()).or_default().insert("text".into(), json!(d)); }
         sim.pump(&mut peer);
         (sim, peer)
@@ -51,7 +52,7 @@ impl Sim {
     }
     fn set_node(&mut self, eid: &str, prop: &str, v: J) {
         self.nodes.entry(eid.into()).or_default().insert(prop.into(), v);
-        if self.subs.iter().any(|s| s == eid) { self.publish_node(eid); }
+        if self.subs.iter().any(|s| s == eid) || self.prefix_subs.iter().any(|p| eid.starts_with(p.as_str())) { self.publish_node(eid); }
     }
     fn publish_node(&mut self, eid: &str) {
         let props: Vec<(String, J)> = self.nodes.get(eid).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
@@ -62,6 +63,11 @@ impl Sim {
     fn on_op(&mut self, op: Op, out: &mut Vec<Op>) {
         match op {
             Op::Sub { target: Target::Id(id), .. } => { self.subs.push(id.clone()); self.publish_node(&id); }
+            Op::Sub { target: Target::Prefix(p), .. } => {
+                self.prefix_subs.push(p.clone());
+                let ids: Vec<String> = self.nodes.keys().filter(|k| k.starts_with(&p)).cloned().collect();
+                for id in ids { self.publish_node(&id); }
+            }
             Op::Wr { wid, id, prop, value } => {
                 if let (Some(m), true) = (self.refuse_for.clone(), true) { if id.contains(&m) { out.push(Op::Res { wid, refused: Some("no tool rows for you".into()) }); return; } }
                 if let Some(why) = self.refuse.clone() { out.push(Op::Res { wid, refused: Some(why) }); return; }
@@ -177,10 +183,8 @@ fn a_seat_with_no_doctrine_gets_the_first_draft_and_one_with_a_doctrine_keeps_th
 }
 
 #[test]
-fn the_draft_doctrine_is_domain_neutral() {
-    let d = DOCTRINE_DRAFT.to_lowercase();
-    assert!(d.contains("graph change"), "{DOCTRINE_DRAFT}");
-    for word in ["babyseat", "membrane", "membrama", "code", "repository", "slot", "ring", "graphlink"] { assert!(!d.contains(word), "the doctrine must not mention {word:?}"); }
+fn the_draft_doctrine_is_the_operators_own_words() {
+    assert_eq!(DOCTRINE_DRAFT.trim_end(), "Your state is stored in a dynamic programmable entity graph of a cliffhanger virtual machine. The machine is Turing-complete so the graph can sense the environment outside of itself and auto-update itself with sensed information. Use your tools to read, manipulate and program the graph state. Information about cliffhanger and VM internals can be found in \"Help\" entities. Every turn, vm sends the log of externally changed entities for you to either react yourself or use cliffhanger to program a behaviour onto the graph. Process the changes, if any, using the provided tools.");
 }
 
 #[test]
@@ -642,135 +646,82 @@ fn a_trail_that_does_not_fit_the_peers_cell_drops_the_oldest_entries_and_says_ho
     assert!(t.last().unwrap()["text"] == "ok" && t.iter().any(|e| e["tool"] == "write"), "the newest entries are kept");
 }
 
-// ---- what the seat owes: `membrane::Owed:<ns>.items`
+// ---- the banner, the tool rows and the skip rule
 
-const OWED: &str = "membrane::Owed:membrama";
-fn item(m: &str) -> J { json!({"message": format!("Chat:main:message:{m}"), "text": format!("words of {m}"), "response": format!("Chat:main:message:{m}:turn:response")}) }
-fn owed(r: &mut Rig, ms: &[&str]) { let v: Vec<J> = ms.iter().map(|m| item(m)).collect(); r.sim.set_node(OWED, "items", json!(v)); }
-const HEAD: &str = "Owed (answer each with a write of text to its response node, or write declined with a reason there):";
-
-#[test]
-fn the_loop_subscribes_to_what_the_seat_owes() {
-    let mut r = Rig::new("o0", Some("d"), cfg());
-    r.drive(4);
-    assert!(r.sim.subs.iter().any(|s| s == OWED), "{:?}", r.sim.subs);
+const BANNER_MAIN: &str = "membrane::Banner:admin:main";
+fn banners(r: &mut Rig, main: &str, others: &[(&str, &str)]) {
+    r.sim.set_node(BANNER_MAIN, "text", json!(main));
+    for (eid, t) in others { r.sim.set_node(&format!("membrane::Banner:{eid}"), "text", json!(t)); }
 }
 
 #[test]
-fn a_new_owed_item_wakes_a_step_told_in_a_section_of_pointers_and_one_left_open_is_an_error() {
-    let mut r = Rig::new("o1", Some("d"), cfg());
+fn the_loop_subscribes_to_the_banners_by_prefix_and_not_to_anything_the_seat_owes() {
+    let mut r = Rig::new("b0", Some("d"), cfg());
     r.drive(4);
-    owed(&mut r, &["a1"]);
-    r.drive(10);
-    assert_eq!(r.model.seen.len(), 1, "an owed item wakes a step with no log line behind it");
+    assert!(r.sim.prefix_subs.iter().any(|s| s == "membrane::Banner:"), "{:?}", r.sim.prefix_subs);
+    assert!(r.sim.subs.iter().all(|s| !s.contains("Owed")), "{:?}", r.sim.subs);
+}
+
+#[test]
+fn the_step_starts_with_the_main_banner_then_the_other_banners_in_banner_tags_then_the_changes() {
+    let mut r = Rig::new("b1", Some("d"), cfg());
+    banners(&mut r, "It is Thursday. You are Blurp.", &[("zeta", "second"), ("alpha", "first note"), ("empty", "  ")]);
+    r.drive(6);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(8);
     let u = user(&r.model.seen[0]);
-    assert!(u.contains(HEAD), "{u}");
-    assert!(u.contains("Chat:main:message:a1 ") && u.contains("Chat:main:message:a1:turn:response"), "{u}");
-    let e = r.error().expect("an item left open is shown");
-    assert!(e.contains("1 owed items still open") && e.contains("Chat:main:message:a1"), "{e}");
+    assert!(u.starts_with("<banner>\nIt is Thursday. You are Blurp.\nfirst note\nsecond\n</banner>\n\nGraph changes"), "{u}");
 }
 
 #[test]
-fn an_item_still_owed_is_offered_again_but_only_a_new_item_or_an_alarm_wakes_a_step() {
-    let mut r = Rig::new("o2", Some("d"), cfg());
-    r.drive(4);
-    owed(&mut r, &["a1"]);
-    r.drive(10);
-    r.drive(30);
-    assert_eq!(r.model.seen.len(), 1, "no retry loop of its own");
-    owed(&mut r, &["a1", "b2"]);
-    r.drive(10);
-    assert_eq!(r.model.seen.len(), 2);
-    let u = user(&r.model.seen[1]);
-    assert!(u.contains("message:a1 ") && u.contains("message:b2 "), "the old item is offered again: {u}");
-    assert!(r.error().unwrap().contains("2 owed items still open"));
-}
-
-#[test]
-fn a_write_of_text_or_declined_on_the_response_resolves_it_and_no_error_is_left() {
-    let mut r = Rig::new("o3", Some("d"), cfg());
-    r.drive(4);
-    r.model.script.push_back(calls(vec![
-        ("write", json!({"id": "Chat:main:message:a1:turn:response", "prop": "text", "value": "hi"})),
-        ("write", json!({"id": "Chat:main:message:b2:turn:response", "prop": "declined", "value": "not for me"})),
-    ]));
-    owed(&mut r, &["a1", "b2"]);
-    r.drive(12);
-    assert_eq!(r.model.seen.len(), 2);
-    assert_eq!(r.error(), None, "both were resolved by this step, although the seat has not yet taken them off the list");
-    owed(&mut r, &[]);
-    r.drive(10);
-    assert_eq!(r.model.seen.len(), 2, "an empty list wakes nothing");
-}
-
-#[test]
-fn an_alarm_step_is_offered_what_is_still_owed_and_nothing_owed_has_no_section() {
-    let mut r = Rig::new("o4", Some("d"), cfg());
+fn an_edit_of_the_banner_shows_in_the_next_step_and_no_banner_is_no_block() {
+    let mut r = Rig::new("b2", Some("d"), cfg());
     r.drive(4);
     r.sim.ext("Message:1", "text", "x");
     r.drive(8);
-    assert!(!user(&r.model.seen[0]).contains(HEAD));
-    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 0.05, "note": "retry"}))]));
-    owed(&mut r, &["a1"]);
-    r.drive(30);
-    assert_eq!(r.model.seen.len(), 4, "model calls: the first step, the owed step (two rounds: the alarm call and its result), the alarm step");
-    assert!(user(r.model.seen.last().unwrap()).contains("message:a1 "));
-}
-
-#[test]
-fn the_step_starts_with_the_banner_in_banner_tags_then_each_owed_line_has_the_persons_whole_words() {
-    let mut r = Rig::new("o5", Some("d"), cfg());
-    r.drive(4);
-    let long = "w".repeat(3000);
-    r.sim.set_node(OWED, "banner", json!("It is Thursday. You are Blurp."));
-    r.sim.set_node(OWED, "items", json!([{"message": "Chat:main:message:a1", "text": long, "response": "Chat:main:message:a1:turn:response"}]));
-    r.drive(10);
-    let u = user(&r.model.seen[0]);
-    assert!(u.starts_with("<banner>\nIt is Thursday. You are Blurp.\n</banner>"), "{}", &u[..80.min(u.len())]);
-    assert!(u.find("</banner>").unwrap() < u.find(HEAD).unwrap());
-    assert!(u.contains(&format!("Chat:main:message:a1 -> Chat:main:message:a1:turn:response: {long}")), "whole text, no cut");
-}
-
-#[test]
-fn no_banner_means_no_banner_block() {
-    let mut r = Rig::new("o6", Some("d"), cfg());
-    r.drive(4);
-    owed(&mut r, &["a1"]);
-    r.drive(10);
     assert!(!user(&r.model.seen[0]).contains("<banner>"));
+    banners(&mut r, "v1", &[]);
+    r.drive(4);
+    r.sim.ext("Message:2", "text", "x");
+    r.drive(8);
+    assert!(user(&r.model.seen[1]).starts_with("<banner>\nv1\n</banner>"));
+    banners(&mut r, "v2, the model's own words", &[]);
+    r.drive(4);
+    r.sim.ext("Message:3", "text", "x");
+    r.drive(8);
+    assert!(user(&r.model.seen[2]).starts_with("<banner>\nv2, the model's own words\n</banner>"));
 }
 
 #[test]
-fn the_result_of_an_acknowledged_answer_or_decline_says_the_item_is_answered_and_other_writes_say_ok() {
-    let mut r = Rig::new("o7", Some("d"), cfg());
-    r.drive(4);
-    r.model.script.push_back(calls(vec![
-        ("write", json!({"id": "Chat:main:message:a1:turn:response", "prop": "text", "value": "hi"})),
-        ("write", json!({"id": "Chat:main:message:b2:turn:response", "prop": "declined", "value": "no"})),
-        ("write", json!({"id": "Note:1", "prop": "text", "value": "x"})),
-    ]));
-    owed(&mut r, &["a1", "b2"]);
-    r.drive(12);
-    let tail: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
-    assert_eq!(tail.len(), 3);
-    for t in &tail[..2] { assert!(t.starts_with("ok: written; this item is answered, do not write to it again"), "{t}"); }
-    assert_eq!(tail[2], "ok");
+fn a_step_wakes_on_a_chat_message_row_and_only_on_an_outside_row_or_an_alarm() {
+    let mut r = Rig::new("b3", Some("d"), cfg());
+    r.drive(10);
+    assert!(r.model.seen.is_empty());
+    banners(&mut r, "a banner change alone is not a wake", &[]);
+    r.drive(10);
+    assert!(r.model.seen.is_empty());
+    r.sim.ext("membrane::Chat:main:message:1-1", "text", "hello");
+    r.drive(8);
+    assert_eq!(r.model.seen.len(), 1);
+    assert!(user(&r.model.seen[0]).contains("Chat:main:message:1-1.text"));
 }
 
 // ---- the tool rows of a step, in the person's chat, as the calls are issued
 
+const MSG: &str = "membrane::Chat:main:message:1-1";
 fn tool_nodes(r: &Rig) -> Vec<String> { let mut v: Vec<String> = r.sim.writes.iter().filter(|w| w.1 == "name" && w.0.contains(":turn:tool:")).map(|w| w.0.clone()).collect(); v.sort(); v }
 
 #[test]
-fn a_call_is_a_tool_row_under_every_turn_the_step_was_shown_at_issue_time_and_its_result_fills_in() {
+fn a_call_is_a_tool_row_under_the_turn_of_each_chat_message_the_step_was_shown_and_its_result_fills_in() {
     let mut r = Rig::new("w1", Some("d"), cfg());
     r.drive(4);
     r.model.script.push_back(calls(vec![("run_cliff", json!({"code": "1 + 1"}))]));
-    owed(&mut r, &["a1", "b2"]);
+    r.sim.ext("membrane::Chat:main:message:1-1", "text", "one");
+    r.sim.ext("membrane::Chat:main:message:1-2", "text", "two");
     r.drive(8);
     let nodes = tool_nodes(&r);
     assert_eq!(nodes.len(), 2, "{nodes:?}");
-    assert!(nodes[0].starts_with("Chat:main:message:a1:turn:tool:") || nodes[1].starts_with("Chat:main:message:a1:turn:tool:"));
+    assert!(nodes[0].starts_with("membrane::Chat:main:message:1-1:turn:tool:") && nodes[1].starts_with("membrane::Chat:main:message:1-2:turn:tool:"), "{nodes:?}");
     let id = nodes[0].rsplit(':').next().unwrap().to_string();
     assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
     for n in &nodes {
@@ -778,7 +729,7 @@ fn a_call_is_a_tool_row_under_every_turn_the_step_was_shown_at_issue_time_and_it
         assert_eq!(r.sim.written(n, "input"), vec![json!({"code": "1 + 1"})]);
         assert!(r.sim.written(n, "result").is_empty(), "the result is not there before the call has run");
     }
-    for m in ["a1", "b2"] { assert_eq!(r.sim.written(&format!("Chat:main:message:{m}"), "tool_ids"), vec![json!(id.clone())], "the message names its tools in the order called"); }
+    for m in ["1-1", "1-2"] { assert_eq!(r.sim.written(&format!("membrane::Chat:main:message:{m}"), "tool_ids"), vec![json!(id.clone())], "the message names its tools in the order called"); }
     let cliff = cliff_node(&r);
     r.sim.set_node(&cliff, "result", json!(2));
     r.drive(10);
@@ -786,7 +737,7 @@ fn a_call_is_a_tool_row_under_every_turn_the_step_was_shown_at_issue_time_and_it
 }
 
 #[test]
-fn a_step_with_no_owed_item_writes_no_tool_rows() {
+fn a_step_shown_no_chat_message_and_writing_to_no_response_writes_no_tool_rows() {
     let mut r = Rig::new("w2", Some("d"), cfg());
     r.drive(4);
     r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "n"}))]));
@@ -797,17 +748,19 @@ fn a_step_with_no_owed_item_writes_no_tool_rows() {
 }
 
 #[test]
-fn the_calls_of_later_rounds_are_added_in_order_to_the_messages_tool_ids() {
+fn a_write_to_a_turns_response_puts_that_call_on_that_turn_and_the_later_calls_too() {
     let mut r = Rig::new("w3", Some("d"), cfg());
     r.drive(4);
-    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "a"}))]));
+    let resp = format!("{MSG}:turn:response");
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi"}))]));
     r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 6, "note": "b"}))]));
-    owed(&mut r, &["a1"]);
-    r.drive(12);
-    let ids = r.sim.written("Chat:main:message:a1", "tool_ids");
-    assert_eq!(ids.len(), 2);
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(14);
+    let ids = r.sim.written(MSG, "tool_ids");
+    assert_eq!(ids.len(), 2, "{ids:?}");
     let (one, two) = (ids[0].as_str().unwrap(), ids[1].as_str().unwrap());
     assert!(two.starts_with(one) && two.split(' ').count() == 2, "{ids:?}");
+    assert_eq!(tool_nodes(&r).len(), 2);
 }
 
 #[test]
@@ -815,12 +768,30 @@ fn a_tool_row_the_seat_refuses_is_an_error_in_plain_words() {
     let mut r = Rig::new("w4", Some("d"), cfg());
     r.drive(4);
     r.sim.refuse_for = Some(":turn:tool:".into());
-    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "a"})), ("write", json!({"id": "Chat:main:message:a1:turn:response", "prop": "text", "value": "hi"}))]));
-    owed(&mut r, &["a1"]);
+    r.model.script.push_back(calls(vec![("alarm", json!({"after_seconds": 5, "note": "a"}))]));
+    r.sim.ext("membrane::Chat:main:message:1-1", "text", "x");
     r.drive(10);
     let e = r.error().expect("shown");
     assert!(e.contains("tool row") && e.contains("no tool rows for you"), "{e}");
 }
+
+#[test]
+fn a_second_write_to_the_same_node_and_property_in_one_step_is_skipped_with_no_write_and_no_row() {
+    let mut r = Rig::new("k1", Some("d"), cfg());
+    r.drive(4);
+    let resp = format!("{MSG}:turn:response");
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi"}))]));
+    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi again, differently"})), ("write", json!({"id": "Note:9", "prop": "text", "value": "other"})), ("write", json!({"id": resp, "prop": "other", "value": "p"}))]));
+    r.sim.ext("Message:1", "text", "x");
+    r.drive(16);
+    assert_eq!(r.sim.written(&resp, "text"), vec![json!("hi")], "the second write never reached the seat");
+    assert_eq!(r.sim.written("Note:9", "text"), vec![json!("other")], "a different node still goes through");
+    assert_eq!(r.sim.written(&resp, "other"), vec![json!("p")], "a different property too");
+    let told: Vec<String> = r.model.seen[2].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert!(told.iter().any(|t| t == "skipped: this node and property were already written in this step"), "{told:?}");
+    assert_eq!(tool_nodes(&r).len(), 3, "rows for the three writes that went out, none for the skipped one: {:?}", tool_nodes(&r));
+}
+
 
 // ---- the live view of the round being generated: `Loop:main.live`
 
@@ -867,19 +838,3 @@ fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker(
     assert!(last.starts_with("[\u{2026}earlier text dropped]\n") && last.ends_with("THE-END"), "{}", &last[..40]);
 }
 
-#[test]
-fn a_later_write_to_an_answered_item_in_the_same_step_is_skipped_with_no_write_and_no_row() {
-    let mut r = Rig::new("k1", Some("d"), cfg());
-    r.drive(4);
-    let resp = "Chat:main:message:a1:turn:response";
-    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi"}))]));
-    r.model.script.push_back(calls(vec![("write", json!({"id": resp, "prop": "text", "value": "hi again, differently"})), ("write", json!({"id": "Note:9", "prop": "text", "value": "other"}))]));
-    owed(&mut r, &["a1"]);
-    r.drive(14);
-    assert_eq!(r.sim.written(resp, "text"), vec![json!("hi")], "the second write never reached the seat");
-    assert_eq!(r.sim.written("Note:9", "text"), vec![json!("other")], "a different node still goes through");
-    let told: Vec<String> = r.model.seen[2].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
-    assert!(told.iter().any(|t| t == "skipped: this item is already answered in this step"), "{told:?}");
-    assert_eq!(tool_nodes(&r).len(), 2, "rows for the first write and for Note:9 only: {:?}", tool_nodes(&r));
-    assert!(r.sim.writes.iter().filter(|w| w.1 == "result").count() == 2, "no result row for the skipped call");
-}
