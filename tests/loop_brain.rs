@@ -182,6 +182,10 @@ fn the_tab_asks_for_its_own_view_by_the_door_and_never_reads_the_logview_by_link
     }
     // follows only while the tab is the active one
     assert!(v.contains("prop('Nav:membrama_log', 'active') == True"), "{v}");
+    // scrollable, kept at the bottom, loads older lines in pages
+    for want in ["'panelrows'", "scroll = 'end'", "View:chat', 'stick_px'", "DomNode:mlog:older:btn", "Load older lines", "'older_out'", "max(0, prop('MLog:main', 'first') - 200)", "200 * (prop('MLog:main', 'pages') or 1)", "prop(r, 'n') < prop('MLog:main', 'first')"] {
+        assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
+    }
     // a line is `n eid.prop op by writer`
     assert!(v.contains("' by '"), "{v}");
 }
