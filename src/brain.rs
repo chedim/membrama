@@ -1,13 +1,13 @@
 //! The loop (docs/design.md, "The loop"): membrama as an always-on co-processor on its own clock. It reads the seat's boundary log through the seat's LogView
 //! (it asks by writing its own `membrama::LogAsk:main`, and reads `rows`: pointers, never values), builds its own step prompt (the doctrine, a node of the seat's
-//! that the operator can edit, and the delta rows), calls its model, and acts with five tools over the link: write (`wr`), read, query (`q`), alarm and run_cliff.
+//! that the operator can edit, and the delta rows), calls its model, and acts with four tools over the link: write (`wr`), read (from the cells the seat publishes), alarm and run_cliff.
 //! Sans-I/O like the rest of the peer: `tick` is called by whoever owns the thread. A step is a few model calls (a round each, bounded by the owner) and
 //! nothing is kept from one step to the next: doctrine + delta is the whole contract.
 use crate::peer::{Peer, Seen};
 use crate::template::{render, Options};
 use crate::toolcall::{detect_format, parse, ToolCall};
 use crate::turn::{Generator, Job, Part, PartKind};
-use graphlink_core::frame::{Op, QueryBy, Target, ValBody};
+use graphlink_core::frame::{Op, Target};
 use graphlink_core::link::Event;
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
@@ -64,7 +64,6 @@ pub fn tool_specs() -> Vec<J> {
     vec![
         f("write", "Set one property of a node.", json!({"type": "object", "properties": {"id": {"type": "string"}, "prop": {"type": "string"}, "value": {}}, "required": ["id", "prop", "value"]})),
         f("read", "Read some properties of a node.", json!({"type": "object", "properties": {"id": {"type": "string"}, "props": {"type": "array", "items": {"type": "string"}}}, "required": ["id", "props"]})),
-        f("query", "List nodes whose id starts with a prefix, or that belong to a class (one of the two).", json!({"type": "object", "properties": {"prefix": {"type": "string"}, "class": {"type": "string"}, "after": {"type": "string"}, "limit": {"type": "integer"}}})),
         f("alarm", "Wake yourself after a number of seconds, with a note. Time reaches you only this way.", json!({"type": "object", "properties": {"after_seconds": {"type": "number"}, "note": {"type": "string"}}, "required": ["after_seconds", "note"]})),
         f("run_cliff", "Run a clifflet (cliffhanger code) on the seat and get its value back, or the error. Use it to program a behaviour onto the graph.", json!({"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]})),
     ]
@@ -83,10 +82,10 @@ impl Row {
 struct Alarm { id: u64, at_ms: u64, note: String }
 
 /// What an op waiting for the seat's answer is, so the answer can be told in the right words.
-enum Inflight { Write { id: String, prop: String }, Read, Query, System(String), Cliff, Quiet }
+enum Inflight { Write { id: String, prop: String }, System(String), Cliff, Quiet }
 
 /// A tool call of the current round: its result, or the id of the op that will bring it.
-enum Pend { Done(String), Wait(String), Cliff { node: String, wid: String } }
+enum Pend { Done(String), Wait { id: String, what: String }, Read { id: String, props: Vec<String> }, Cliff { node: String, wid: String } }
 
 struct Step { messages: Vec<J>, round: usize, pending: Vec<Pend>, failed: bool }
 
@@ -111,6 +110,7 @@ pub struct Brain {
     steps: u64,
     error: Option<String>,
     published_cursor: Option<u64>,
+    waiting: Option<String>,
 }
 
 /// The writer the seat records for a write this peer makes (`link:<namespace>`): the lines in the log with it are the loop's own.
@@ -120,7 +120,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, waiting: None,
         }
     }
 
@@ -135,18 +135,12 @@ impl Brain {
         self.run(peer, model)
     }
 
-    /// Records what the seat answered: the result of a write, a read or a query, in words for the model.
+    /// Records what the seat answered: the result of a write, in words for the model.
     fn absorb(&mut self, peer: &mut Peer, events: &[Event]) {
         for e in events {
             let Event::Op(op) = e else { continue };
             let (id, text) = match op {
                 Op::Res { wid, refused } => (wid.clone(), match refused { None => "ok".to_string(), Some(why) => format!("refused: {why}") }),
-                Op::Val { rid: Some(rid), body, .. } => (rid.clone(), match body {
-                    ValBody::Props(p) => p.to_string(),
-                    ValBody::Gone => "there is no such node".to_string(),
-                    ValBody::Refused(why) => format!("not shown: {why}"),
-                }),
-                Op::Page { qid, rows, next, total } => (qid.clone(), json!({"rows": rows, "next": next, "total": total}).to_string()),
                 _ => continue,
             };
             match self.inflight.remove(&id) {
@@ -158,7 +152,6 @@ impl Brain {
                 // the write of a cliff's code: an ok says nothing (the result comes on the node), a refusal ends the call
                 Some(Inflight::Cliff) => { if text.starts_with("refused: ") { self.answers.insert(id, text); } }
                 Some(Inflight::Quiet) => {}
-                Some(_) => { self.answers.insert(id, text); }
                 None => {}
             }
         }
@@ -270,9 +263,23 @@ impl Brain {
     fn settle(&mut self, peer: &mut Peer, model: &mut dyn Model) -> Result<(), String> {
         let Some(step) = &mut self.step else { return Ok(()) };
         let mut retire: Vec<String> = vec![];
+        let mut unsub: Vec<String> = vec![];
         for p in step.pending.iter_mut() {
             match p {
-                Pend::Wait(id) => { if let Some(t) = self.answers.remove(id.as_str()) { *p = Pend::Done(t); } }
+                Pend::Wait { id, .. } => { if let Some(t) = self.answers.remove(id.as_str()) { *p = Pend::Done(t); } }
+                Pend::Read { id, props } => {
+                    // the seat publishes what is subscribed: a node it says is gone is not there, a live one has its props in cells
+                    let told = match peer.exists(id)? {
+                        None => None,
+                        Some(false) => Some("there is no such node".to_string()),
+                        Some(true) => {
+                            let mut m = serde_json::Map::new();
+                            for k in props.iter() { if let Seen::Live(v) = peer.seen(id, k)? { m.insert(k.clone(), v); } }
+                            Some(J::Object(m).to_string())
+                        }
+                    };
+                    if let Some(t) = told { unsub.push(id.clone()); *p = Pend::Done(t); }
+                }
                 Pend::Cliff { node, wid } => {
                     let done = if let Some(t) = self.answers.remove(wid.as_str()) { Some((t, false)) } else {
                         match (peer.seen(node, "result")?, peer.seen(node, "error")?) {
@@ -293,8 +300,10 @@ impl Brain {
             self.inflight.insert(wid, Inflight::Quiet);
             peer.unsubscribe(Target::Id(node))?;
         }
+        for node in unsub { peer.unsubscribe(Target::Id(node))?; }
+        self.show_waiting(peer)?;
         let Some(step) = &mut self.step else { return Ok(()) };
-        if step.pending.iter().any(|p| matches!(p, Pend::Wait(_) | Pend::Cliff { .. })) { return Ok(()); }
+        if step.pending.iter().any(|p| matches!(p, Pend::Wait { .. } | Pend::Read { .. } | Pend::Cliff { .. })) { return Ok(()); }
         for p in std::mem::take(&mut step.pending) { if let Pend::Done(t) = p { step.messages.push(json!({"role": "tool", "content": t})); } }
         self.round(peer, model)
     }
@@ -318,11 +327,27 @@ impl Brain {
         let mut pending = Vec::new();
         for (i, c) in reply.tool_calls.iter().enumerate() { pending.push(self.call(peer, c, &format!("call_{}_{round}_{i}", self.steps))?); }
         if let Some(step) = &mut self.step { step.pending = pending; }
+        self.show_waiting(peer)
+    }
+
+    /// Says on the loop's node what the step in hand is waiting for (null when it waits for nothing): a wait has no timeout, so it must be seen.
+    fn show_waiting(&mut self, peer: &mut Peer) -> Result<(), String> {
+        let now: Option<String> = self.step.as_ref().and_then(|s| {
+            let w: Vec<String> = s.pending.iter().filter_map(|p| match p {
+                Pend::Wait { what, .. } => Some(what.clone()),
+                Pend::Read { id, .. } => Some(format!("read of {id} (the seat's cells for it)")),
+                Pend::Cliff { node, .. } => Some(format!("run_cliff on {node} (`result` or `error` from the seat's runner)")),
+                Pend::Done(_) => None,
+            }).collect();
+            if w.is_empty() { None } else { Some(format!("waiting for the answer to: {}", w.join("; "))) }
+        });
+        if now != self.waiting { peer.publish(LOOP_ID, "waiting", &now.as_ref().map_or(J::Null, |t| json!(t)))?; self.waiting = now; }
         Ok(())
     }
 
     fn finish(&mut self, peer: &mut Peer, said: Option<String>) -> Result<(), String> {
         let failed = self.step.take().map(|s| s.failed).unwrap_or(false);
+        self.show_waiting(peer)?;
         self.steps += 1;
         peer.publish(LOOP_ID, "steps", &json!(self.steps))?;
         if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(t))?; }
@@ -341,26 +366,16 @@ impl Brain {
                 let Some(prop) = text("prop") else { return missing("prop") };
                 let Some(value) = a.get("value") else { return missing("value") };
                 let wid = peer.write(&id, &prop, value)?;
+                let what = format!("write of {id}.{prop}");
                 self.inflight.insert(wid.clone(), Inflight::Write { id, prop });
-                Ok(Pend::Wait(wid))
+                Ok(Pend::Wait { id: wid, what })
             }
             "read" => {
                 let Some(id) = text("id") else { return missing("id") };
                 let Some(props) = a.get("props").and_then(J::as_array) else { return missing("props") };
                 let props: Vec<String> = props.iter().filter_map(J::as_str).map(String::from).collect();
-                let rid = peer.read_req(&id, &props)?;
-                self.inflight.insert(rid.clone(), Inflight::Read);
-                Ok(Pend::Wait(rid))
-            }
-            "query" => {
-                let by = match (text("prefix"), text("class")) {
-                    (Some(p), None) => QueryBy::Prefix(p),
-                    (None, Some(k)) => QueryBy::Class(k),
-                    _ => return Ok(Pend::Done("error: query needs exactly one of `prefix` and `class`".into())),
-                };
-                let qid = peer.query(by, text("after"), a.get("limit").and_then(J::as_u64))?;
-                self.inflight.insert(qid.clone(), Inflight::Query);
-                Ok(Pend::Wait(qid))
+                peer.subscribe(Target::Id(id.clone()), Some(props.clone()))?;
+                Ok(Pend::Read { id, props })
             }
             "alarm" => {
                 let Some(secs) = a.get("after_seconds").and_then(J::as_f64).filter(|s| *s >= 0.0) else { return missing("after_seconds") };
@@ -383,7 +398,7 @@ impl Brain {
                 self.inflight.insert(wid.clone(), Inflight::Cliff);
                 Ok(Pend::Cliff { node, wid })
             }
-            other => Ok(Pend::Done(format!("error: there is no tool named `{other}`; the tools are write, read, query, alarm and run_cliff"))),
+            other => Ok(Pend::Done(format!("error: there is no tool named `{other}`; the tools are write, read, alarm and run_cliff"))),
         }
     }
 }
