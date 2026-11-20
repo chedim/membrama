@@ -110,6 +110,8 @@ pub struct Brain {
     steps: u64,
     error: Option<String>,
     published_cursor: Option<u64>,
+    /// the wall clock at construction, in milliseconds, in hex: part of every call id so a restart (the step counter starts at 0 again) cannot repeat one
+    run: String,
     waiting: Option<String>,
 }
 
@@ -120,7 +122,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, waiting: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None,
         }
     }
 
@@ -322,13 +324,16 @@ impl Brain {
             self.fail(peer, &format!("the step ended after {} rounds with the model still asking for tools; those calls were not run", self.cfg.max_rounds));
             return self.finish(peer, Some(reply.text));
         }
-        let calls: Vec<J> = reply.tool_calls.iter().enumerate().map(|(i, c)| json!({"id": format!("call_{}_{round}_{i}", self.steps), "type": "function", "function": {"name": c.name, "arguments": c.arguments}})).collect();
+        let calls: Vec<J> = reply.tool_calls.iter().enumerate().map(|(i, c)| json!({"id": self.call_id(round, i), "type": "function", "function": {"name": c.name, "arguments": c.arguments}})).collect();
         if let Some(step) = &mut self.step { step.messages.push(json!({"role": "assistant", "content": reply.text, "tool_calls": calls})); }
         let mut pending = Vec::new();
-        for (i, c) in reply.tool_calls.iter().enumerate() { pending.push(self.call(peer, c, &format!("call_{}_{round}_{i}", self.steps))?); }
+        for (i, c) in reply.tool_calls.iter().enumerate() { pending.push(self.call(peer, c, &self.call_id(round, i))?); }
         if let Some(step) = &mut self.step { step.pending = pending; }
         self.show_waiting(peer)
     }
+
+    /// A tool call's id: letters and digits only (the seat's runner makes it part of pack names and refuses anything else), and different for each run of the process, step, round and call.
+    fn call_id(&self, round: usize, i: usize) -> String { format!("c{}s{}r{round}n{i}", self.run, self.steps) }
 
     /// Says on the loop's node what the step in hand is waiting for (null when it waits for nothing): a wait has no timeout, so it must be seen.
     fn show_waiting(&mut self, peer: &mut Peer) -> Result<(), String> {
