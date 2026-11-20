@@ -498,7 +498,7 @@ impl Brain {
         self.show_waiting(peer)?;
         self.steps += 1;
         peer.publish(LOOP_ID, "steps", &json!(self.steps))?;
-        if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(t))?; }
+        if let Some(t) = said { peer.publish(LOOP_ID, "said", &json!(live_tail(&t, peer.val_cap() as usize)))?; }   // longer than the cell: its tail, as `live` does; a write that cannot fit must not end the loop
         if !failed && self.error.is_some() { self.error = None; peer.publish(LOOP_ID, "error", &J::Null)?; }
         Ok(())
     }
