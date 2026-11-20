@@ -352,6 +352,20 @@ fn the_delta_cap_bounds_one_step_and_the_rest_is_the_next_step() {
 }
 
 #[test]
+fn a_full_backlog_of_its_own_lines_does_not_stop_the_reading() {
+    // seen live: the loop's own writes when it connects filled the delta cap; none of them wakes a step, so nothing drained them and the cursor never moved on
+    let mut r = Rig::new("l15b", Some("d"), BrainConfig { delta_cap: 3, start: Start::Beginning, ..cfg() });
+    for i in 0..6 { r.sim.log(&format!("Pack:p{i}"), "text", "link:membrama", 5); }
+    r.drive(8);
+    r.sim.ext("Message:late", "text", "x");
+    r.drive(20);
+    assert_eq!(r.model.seen.len(), 1, "the outside line woke a step although its own lines filled the cap before it");
+    let u = user(&r.model.seen[0]);
+    assert!(u.contains("Message:late"), "{u}");
+    assert!(r.own(LOOP_ID, "cursor").unwrap().as_u64().unwrap() >= 7, "{:?}", r.own(LOOP_ID, "cursor"));
+}
+
+#[test]
 fn the_rounds_of_one_step_are_bounded_and_the_error_says_so() {
     let mut r = Rig::new("l16", Some("d"), BrainConfig { max_rounds: 3, ..cfg() });
     r.drive(4);
