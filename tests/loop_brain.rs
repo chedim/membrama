@@ -642,7 +642,7 @@ fn a_trail_that_does_not_fit_the_peers_cell_drops_the_oldest_entries_and_says_ho
 // ---- what the seat owes: `membrane::Owed:<ns>.items`
 
 const OWED: &str = "membrane::Owed:membrama";
-fn item(m: &str) -> J { json!({"message": format!("Chat:main:message:{m}"), "response": format!("Chat:main:message:{m}:turn:response")}) }
+fn item(m: &str) -> J { json!({"message": format!("Chat:main:message:{m}"), "text": format!("words of {m}"), "response": format!("Chat:main:message:{m}:turn:response")}) }
 fn owed(r: &mut Rig, ms: &[&str]) { let v: Vec<J> = ms.iter().map(|m| item(m)).collect(); r.sim.set_node(OWED, "items", json!(v)); }
 const HEAD: &str = "Owed (answer each with a write of text to its response node, or write declined with a reason there):";
 
@@ -712,4 +712,44 @@ fn an_alarm_step_is_offered_what_is_still_owed_and_nothing_owed_has_no_section()
     r.drive(30);
     assert_eq!(r.model.seen.len(), 4, "model calls: the first step, the owed step (two rounds: the alarm call and its result), the alarm step");
     assert!(user(r.model.seen.last().unwrap()).contains("message:a1 "));
+}
+
+#[test]
+fn the_step_starts_with_the_banner_in_banner_tags_then_each_owed_line_has_the_persons_whole_words() {
+    let mut r = Rig::new("o5", Some("d"), cfg());
+    r.drive(4);
+    let long = "w".repeat(5000);
+    r.sim.set_node(OWED, "banner", json!("It is Thursday. You are Blurp."));
+    r.sim.set_node(OWED, "items", json!([{"message": "Chat:main:message:a1", "text": long, "response": "Chat:main:message:a1:turn:response"}]));
+    r.drive(10);
+    let u = user(&r.model.seen[0]);
+    assert!(u.starts_with("<banner>\nIt is Thursday. You are Blurp.\n</banner>"), "{}", &u[..80.min(u.len())]);
+    assert!(u.find("</banner>").unwrap() < u.find(HEAD).unwrap());
+    assert!(u.contains(&format!("Chat:main:message:a1 -> Chat:main:message:a1:turn:response: {long}")), "whole text, no cut");
+}
+
+#[test]
+fn no_banner_means_no_banner_block() {
+    let mut r = Rig::new("o6", Some("d"), cfg());
+    r.drive(4);
+    owed(&mut r, &["a1"]);
+    r.drive(10);
+    assert!(!user(&r.model.seen[0]).contains("<banner>"));
+}
+
+#[test]
+fn the_result_of_an_acknowledged_answer_or_decline_says_the_item_is_answered_and_other_writes_say_ok() {
+    let mut r = Rig::new("o7", Some("d"), cfg());
+    r.drive(4);
+    r.model.script.push_back(calls(vec![
+        ("write", json!({"id": "Chat:main:message:a1:turn:response", "prop": "text", "value": "hi"})),
+        ("write", json!({"id": "Chat:main:message:b2:turn:response", "prop": "declined", "value": "no"})),
+        ("write", json!({"id": "Note:1", "prop": "text", "value": "x"})),
+    ]));
+    owed(&mut r, &["a1", "b2"]);
+    r.drive(12);
+    let tail: Vec<String> = r.model.seen[1].0.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert_eq!(tail.len(), 3);
+    for t in &tail[..2] { assert!(t.starts_with("ok: written; this item is answered, do not write to it again"), "{t}"); }
+    assert_eq!(tail[2], "ok");
 }
