@@ -36,7 +36,11 @@ pub struct BrainConfig {
 pub struct Reply { pub text: String, pub tool_calls: Vec<ToolCall> }
 
 /// Whatever turns a step's messages (OpenAI shape) and tools into a reply: the real one is `TemplateModel`; a test uses a stub.
-pub trait Model { fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String>; }
+pub trait Model {
+    fn step(&mut self, messages: &[J], tools: &[J]) -> Result<Reply, String>;
+    /// The same call, handing each piece of text to `on_text` as the model writes it (the loop shows the round's text so far); a model that cannot stream hands nothing.
+    fn step_live(&mut self, messages: &[J], tools: &[J], _on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> { self.step(messages, tools) }
+}
 
 /// The seat's node holding the doctrine (its `text` is the words a step starts with). The operator edits it there; membrama writes the first draft only when the node does not exist.
 pub const DOCTRINE_ID: &str = "membrane::Doctrine:membrama";

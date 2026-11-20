@@ -821,3 +821,48 @@ fn a_tool_row_the_seat_refuses_is_an_error_in_plain_words() {
     let e = r.error().expect("shown");
     assert!(e.contains("tool row") && e.contains("no tool rows for you"), "{e}");
 }
+
+// ---- the live view of the round being generated: `Loop:main.live`
+
+/// A model that writes its round in pieces and looks at the loop's `live` cell after each one, as the seat would between two of its turns.
+struct Chunked { pieces: Vec<String>, reader: Option<CellsReader>, name: String, partials: Vec<String> }
+impl Model for Chunked {
+    fn step(&mut self, _m: &[J], _t: &[J]) -> Result<Reply, String> { self.step_live(_m, _t, &mut |_| {}) }
+    fn step_live(&mut self, _m: &[J], _t: &[J], on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+        if self.reader.is_none() { self.reader = CellsReader::attach(format!("/gl-{}-pc", self.name)).ok(); }
+        for p in self.pieces.clone() {
+            on_text(&p);
+            self.partials.push(cell(self.reader.as_ref().unwrap(), LOOP_ID, "live").and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "<none>".into()));
+        }
+        Ok(Reply { text: self.pieces.concat(), tool_calls: vec![] })
+    }
+}
+
+fn live_rig(tag: &str, pieces: Vec<String>) -> (Sim, Peer, Brain, Chunked) {
+    let (mut sim, mut peer) = Sim::new(tag, Some("d"));
+    let mut brain = Brain::new(cfg(), "membrama");
+    let mut model = Chunked { pieces, reader: None, name: sim.seat.name.clone(), partials: vec![] };
+    for i in 0..4 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 1_000 + i * 10).unwrap(); }
+    (sim, peer, brain, model)
+}
+
+#[test]
+fn the_text_of_the_round_so_far_is_published_as_it_grows_and_cleared_when_the_round_ends() {
+    let (mut sim, mut peer, mut brain, mut model) = live_rig("v1", vec!["<think>hm".into(), "m</think>Hel".into(), "lo".into()]);
+    sim.ext("Message:1", "text", "x");
+    for i in 0..6 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 2_000 + i * 10).unwrap(); }
+    assert_eq!(model.partials, vec!["<think>hm", "<think>hmm</think>Hel", "<think>hmm</think>Hello"], "thinking included, not stripped; it grows");
+    assert_eq!(cell(&sim.seat.reader(), LOOP_ID, "live"), Some(json!("")), "cleared at the end of the round");
+}
+
+#[test]
+fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker() {
+    let cap = membrama::peer::Numbers { slots: 0, key_cap: 0, val_cap: 4096, epoch: 0, spins: 0, depth: 0 }.val_cap as usize;
+    let piece = "abcdefghij".repeat(100);
+    let (mut sim, mut peer, mut brain, mut model) = live_rig("v2", vec![piece.clone(), piece.clone(), piece.clone(), piece.clone(), "THE-END".into()]);
+    sim.ext("Message:1", "text", "x");
+    for i in 0..6 { let ev = sim.pump(&mut peer); brain.tick(&mut peer, &mut model, &ev, 2_000 + i * 10).unwrap(); }
+    assert!(model.partials.iter().all(|p| serde_json::to_string(p).unwrap().len() <= cap), "never above val_cap");
+    let last = model.partials.last().unwrap();
+    assert!(last.starts_with("[\u{2026}earlier text dropped]\n") && last.ends_with("THE-END"), "{}", &last[..40]);
+}
