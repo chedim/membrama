@@ -185,7 +185,8 @@ fn the_tab_asks_for_its_own_view_by_the_door_and_never_reads_the_logview_by_link
     let v = viewer_pack("membrama");
     // the view is virtual and a link does not carry it: no read of it by `prop(...)`, no namespace baked in
     assert!(!v.contains("prop('membrane::LogView"), "the tab must not read the LogView through the link:\n{v}");
-    assert!(!v.contains("@NS@") && !v.contains("membrama::"), "the tab asks in the page's own namespace:\n{v}");
+    // the log asks in the page's own namespace; only the loop's own node (the raw chat) names the peer's
+    assert!(!v.contains("@NS@") && !v.replace("membrama::Loop:main", "").contains("membrama::"), "the tab asks in the page's own namespace:\n{v}");
     for want in ["IMPORT fetch 1", "'::LogAsk:main'", "'membrane::LogView:'", "entity_write", "entity_read", "'rows'", "'head'", "'from'", "'n'",
                  "Link:page", "'ns'", "Shell.tick on-setter", "Nav:membrama_log", "200", "max(0,", "Fetch:mlog:"] {
         assert!(v.contains(want), "the viewer should contain {want:?}:\n{v}");
@@ -912,5 +913,46 @@ fn the_live_text_never_exceeds_the_peers_cell_and_keeps_the_tail_after_a_marker(
     assert!(model.partials.iter().all(|p| serde_json::to_string(p).unwrap().len() <= cap), "never above val_cap");
     let last = model.partials.last().unwrap();
     assert!(last.starts_with("[\u{2026}earlier text dropped]\n") && last.ends_with("THE-END"), "{}", &last[..40]);
+}
+
+// ---- the raw chat with the model: `Loop:main.chat`
+
+#[test]
+fn the_log_tab_shows_the_raw_chat_it_reads_from_the_loops_own_node_by_the_door() {
+    let v = viewer_pack("brain2");
+    for want in ["('DomNode:mlog:chat').tag = 'pre'", "'spec': 'brain2::Loop:main', 'prop': 'chat'", "Fetch:mchat:read", "membrama-chat-poll", "('DomNode:mlog:chat').text = this.shown"] {
+        assert!(v.contains(want), "the viewer should contain {want:?}");
+    }
+    assert!(!v.contains("@NS@"), "every namespace slot is filled");
+}
+
+fn chat(r: &Rig) -> String { r.own(LOOP_ID, "chat").and_then(|v| v.as_str().map(String::from)).unwrap_or_default() }
+
+#[test]
+fn the_chat_is_the_raw_exchange_prompt_reply_with_its_thinking_calls_and_results() {
+    let mut r = Rig::new("rc1", Some("THE-DOCTRINE"), cfg());
+    r.drive(4);
+    r.model.script.push_back(Ok(Reply { text: "<think>hidden thought</think>looking".into(), tool_calls: vec![ToolCall { name: "read".into(), arguments: json!({"id": "Message:7", "props": ["text"]}) }] }));
+    r.model.script.push_back(Ok(Reply { text: "all done".into(), tool_calls: vec![] }));
+    r.sim.ext("Message:7", "text", "THE-BODY");
+    r.drive(10);
+    let c = chat(&r);
+    let at = |s: &str| c.find(s).unwrap_or_else(|| panic!("{s:?} is not in the chat: {c}"));
+    // in the order they happened
+    assert!(at("THE-DOCTRINE") < at("Message:7") && at("hidden thought") < at("THE-BODY") && at("THE-BODY") < at("all done"), "{c}");
+    assert!(c.contains("<think>hidden thought</think>"), "the reply is raw, thinking included: {c}");
+}
+
+#[test]
+fn the_chat_keeps_earlier_steps_and_drops_the_oldest_text_first_when_the_cell_is_full() {
+    let mut r = Rig::new("rc2", Some("d"), cfg());
+    r.drive(4);
+    for k in 0..40 { r.model.script.push_back(Ok(Reply { text: format!("answer-{k}-{}", "z".repeat(300)), tool_calls: vec![] })); }
+    for k in 0..40 { r.sim.ext(&format!("Message:{k}"), "text", "x"); r.drive(6); }
+    let c = chat(&r);
+    assert!(serde_json::to_string(&c).unwrap().len() <= r.peer.val_cap() as usize, "never above val_cap");
+    assert!(c.starts_with("[\u{2026}earlier text dropped]\n"), "{}", &c[..40.min(c.len())]);
+    assert!(c.contains("answer-39-"), "the newest is kept");
+    assert!(!c.contains("answer-0-"), "the oldest went first");
 }
 

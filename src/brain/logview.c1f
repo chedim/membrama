@@ -31,6 +31,11 @@ Nav.active on-setter membrama-log-draw:
     ('DomNode:mlog:older:btn').text = 'Load older lines'
     ('DomNode:mlog:text').parent = 'DomNode:mlog:root'
     ('DomNode:mlog:text').tag = 'pre'
+    ('DomNode:mlog:chathead').parent = 'DomNode:mlog:root'
+    ('DomNode:mlog:chathead').tag = 'div'
+    ('DomNode:mlog:chathead').text = 'Chat with the model (raw: the prompt, the reply with its thinking, each call and its result; the oldest text drops first)'
+    ('DomNode:mlog:chat').parent = 'DomNode:mlog:root'
+    ('DomNode:mlog:chat').tag = 'pre'
     ('Nav:membrama_log').filled = True
     ('MLog:main').on = True
 
@@ -133,3 +138,28 @@ Fetch.mq on-setter membrama-log-step:
     ('MLog:main').note = None
     ('MLog:main').polling = False
     ('MLog:main').last_poll = clock
+
+-- THE RAW CHAT WITH THE MODEL, under the log lines: the loop's own `@NS@::Loop:main.chat` (src/brain.rs, `chat_add`), read by the door like the log (`entity_read`, one POST, `Fetch:mchat:read`) on the same tick, while the tab is in front.
+-- Its own state `MChat:main` (`text`, `polling`, `last_poll`, `seq`, `note`) so it never waits on the log's calls; a call that fails is said under the heading.
+Shell.tick on-setter membrama-chat-poll:
+  WHEN this.open and prop('Nav:membrama_log', 'active') == True and not prop('MChat:main', 'polling') and not prop('Conn:page', 'hidden') and this.tick - (prop('MChat:main', 'last_poll') or 0) >= this.status_ms / 1000:
+    n = (prop('MChat:main', 'seq') or 0) + 1
+    ('MChat:main').seq = n
+    ('MChat:main').polling = True
+    ('Fetch:mchat:read').request = {'timeout_s': 10, 'id': 'mchat-read-' + str(n), 'url': '/mcp', 'method': 'POST', 'headers': {'content-type': 'application/json'}, 'body': str({'jsonrpc': '2.0', 'id': n, 'method': 'tools/call', 'params': {'name': 'entity_read', 'arguments': {'spec': '@NS@::Loop:main', 'prop': 'chat'}}})}
+
+Fetch.mq on-setter membrama-chat-step:
+  WHEN this.eid == 'Fetch:mchat:read' and this.mq != None and not prop(this.mq, 'ok'):
+    ('MChat:main').note = 'the seat did not answer the model chat: ' + str(prop(this.mq, 'why'))
+    ('MChat:main').polling = False
+    ('MChat:main').last_poll = clock
+  ELSE WHEN this.eid == 'Fetch:mchat:read' and this.mq != None:
+    ('MChat:main').text = str(prop(this.mq, 'text') or '')
+    ('MChat:main').note = None
+    ('MChat:main').polling = False
+    ('MChat:main').last_poll = clock
+
+MChat.shown getter: (str(this.text) if this.text else '(nothing yet: the model has not been asked anything)') + (('\n' + str(this.note)) if this.note else '')
+MChat.shown on-setter membrama-chat-show:
+  WHEN prop('Nav:membrama_log', 'filled') == True:
+    ('DomNode:mlog:chat').text = this.shown

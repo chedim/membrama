@@ -132,6 +132,9 @@ pub struct Brain {
     /// the last step's trail: for each round the model's visible text, for each tool call `{step, round, tool, args, result}`
     trail: Vec<J>,
     published_trail: Option<String>,
+    /// the raw chat with the model, as `Loop:main.chat` shows it: every step's prompt, each reply as the model wrote it (thinking included), each call and its result; the oldest text goes first
+    chat: String,
+    published_chat: Option<String>,
 }
 
 /// The writer the seat records for a write this peer makes (`link:<namespace>`): the lines in the log with it are the loop's own.
@@ -141,7 +144,7 @@ impl Brain {
     pub fn new(cfg: BrainConfig, ns: &str) -> Brain {
         Brain {
             cfg, ns: ns.into(), writer: own_writer(ns), tools: tool_specs(), now: 0, subscribed: false, seeded: false, cursor: None, asks: 0, next_ask: None,
-            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, trail: vec![], published_trail: None,
+            backlog: vec![], alarms: vec![], alarm_seq: 0, fired: vec![], inflight: HashMap::new(), answers: HashMap::new(), step: None, steps: 0, error: None, published_cursor: None, run: format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)), waiting: None, trail: vec![], published_trail: None, chat: String::new(), published_chat: None,
         }
     }
 
@@ -335,15 +338,22 @@ impl Brain {
         self.record_results(peer)?;
         let Some(step) = &mut self.step else { return Ok(()) };
         if step.pending.iter().any(|p| matches!(p, Pend::Wait { .. } | Pend::Cliff { .. })) { return Ok(()); }
-        for p in std::mem::take(&mut step.pending) { if let Pend::Done(t) = p { step.messages.push(json!({"role": "tool", "content": t})); } }
+        let done: Vec<String> = std::mem::take(&mut step.pending).into_iter().filter_map(|p| if let Pend::Done(t) = p { Some(t) } else { None }).collect();
+        for t in &done { step.messages.push(json!({"role": "tool", "content": t})); }
+        for t in &done { self.chat_add(peer, &format!("[tool]\n{t}\n"))?; }
         self.round(peer, model)
     }
 
     /// One call of the model; the tools it asks for are started (their results are waited for on later ticks), or the step ends.
     fn round(&mut self, peer: &mut Peer, model: &mut dyn Model) -> Result<(), String> {
+        let (round, head) = {
+            let Some(step) = &mut self.step else { return Ok(()) };
+            step.round += 1;
+            let head = (step.round == 1).then(|| step.messages.iter().map(|m| format!("[{}]\n{}\n", m["role"].as_str().unwrap_or(""), m["content"].as_str().unwrap_or(""))).collect::<String>());
+            (step.round, head)
+        };
+        if let Some(h) = head { self.chat_add(peer, &format!("\u{2500}\u{2500} step {} \u{2500}\u{2500}\n{h}", self.steps + 1))?; }
         let Some(step) = &mut self.step else { return Ok(()) };
-        step.round += 1;
-        let round = step.round;
         // the round so far goes to `live` with every piece the model writes (as the chat turn handler publishes each chunk, src/turn.rs), the tail kept when it would not fit the peer's cell
         let cap = peer.val_cap() as usize;
         let mut live = String::new();
@@ -358,6 +368,8 @@ impl Brain {
             Ok(r) => r,
             Err(e) => { self.fail(peer, &format!("the model call failed: {e}")); return self.finish(peer, None); }
         };
+        let said_raw = format!("[assistant]\n{}\n{}", reply.text, reply.tool_calls.iter().map(|c| format!("[call] {} {}\n", c.name, c.arguments)).collect::<String>());
+        self.chat_add(peer, &said_raw)?;
         let seen = visible(&reply.text);
         let no = self.steps + 1;
         if !seen.is_empty() { eprintln!("membrama: step {no} round {round} said {seen}"); self.trail.push(json!({"step": no, "round": round, "text": seen})); }
@@ -426,6 +438,20 @@ impl Brain {
         let a = &c.arguments;
         let (Some(id), Some(prop)) = (a.get("id").and_then(J::as_str), a.get("prop").and_then(J::as_str)) else { return false };
         step.wrote.iter().any(|(i, p)| i == id && p == prop)
+    }
+
+    /// Adds to the raw chat and publishes it (`chat`) when it changed: all of it, or its tail after a marker line when it would not fit the peer's cell. What is kept in memory is bounded by the cell too.
+    fn chat_add(&mut self, peer: &mut Peer, text: &str) -> Result<(), String> {
+        let cap = peer.val_cap() as usize;
+        self.chat.push_str(text);
+        if self.chat.len() > cap * 2 {
+            let mut from = self.chat.len() - cap;
+            while !self.chat.is_char_boundary(from) { from += 1; }
+            self.chat.drain(..from);
+        }
+        let shown = live_tail(&self.chat, cap);
+        if self.published_chat.as_deref() != Some(shown.as_str()) { peer.publish(LOOP_ID, "chat", &json!(shown))?; self.published_chat = Some(shown); }
+        Ok(())
     }
 
     /// A call that was not run: its entry in the trail, with the reason as its result.
